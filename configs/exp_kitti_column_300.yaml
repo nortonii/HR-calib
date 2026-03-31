@@ -1,0 +1,11 @@
+parent_config: "configs/exp_kitti_column_smoke.yaml"
+
+exp_name: "kitti_column_300"
+gpus: [2]
+testing_iterations: 100
+saving_iterations: [100, 200, 300]
+visual_interval: 100
+
+opt:
+  iterations: 300
+  position_lr_max_steps: 300

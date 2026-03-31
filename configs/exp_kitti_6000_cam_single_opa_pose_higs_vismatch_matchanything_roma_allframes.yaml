@@ -1,0 +1,20 @@
+parent_config: "configs/exp_kitti_3000_cam_single_opa_pose_higs.yaml"
+
+exp_name: "kitti_center_6000_cam_single_opa_pose_higs_vismatch_matchanything_roma_allframes"
+
+testing_iterations: 200
+saving_iterations: [4000, 6000]
+visual_interval: 500
+
+opt:
+  iterations: 6000
+  position_lr_max_steps: 6000
+
+model:
+  pose_correction:
+    update_method: vismatch
+    translation_lr: 0.0
+    rotation_lr: 0.0
+    matcher_name: matchanything-roma
+    matcher_update_interval: 50
+    matcher_update_blend: 1.0

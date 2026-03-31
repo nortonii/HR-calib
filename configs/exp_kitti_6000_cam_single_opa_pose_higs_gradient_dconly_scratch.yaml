@@ -1,0 +1,14 @@
+parent_config: "configs/exp_kitti_3000_cam_single_opa_pose_higs.yaml"
+
+exp_name: "kitti_center_6000_cam_single_opa_pose_higs_gradient_dconly_scratch"
+
+testing_iterations: 200
+saving_iterations: [4000, 6000]
+visual_interval: 500
+
+model:
+  dc_only_sh: True
+
+opt:
+  iterations: 6000
+  position_lr_max_steps: 6000

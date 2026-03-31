@@ -1,0 +1,9 @@
+parent_config: "configs/kitti360/kitti_base.yaml"
+
+kitti_seq: 3
+frame_length: [99, 128]
+eval_frames: [105, 112, 119, 126]
+
+scene_id: kn3_dual_opa
+
+dynamic: False

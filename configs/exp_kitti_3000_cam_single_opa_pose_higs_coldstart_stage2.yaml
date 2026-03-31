@@ -1,0 +1,17 @@
+parent_config: "configs/exp_kitti_3000_cam_single_opa_pose_higs.yaml"
+
+exp_name: "kitti_center_3000_cam_single_opa_pose_higs_coldstart_stage2"
+
+model:
+  pose_correction:
+    mode: all
+    translation_lr: 0.0005
+    rotation_lr: 0.0002
+    accumulate_steps: 8
+    stage_translation: False
+    use_gt_translation: False
+    init_translation_std: 0.0
+    init_rotation_deg: 0.0
+    init_se3: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    lambda_translation: 0.0
+    lambda_rotation: 0.0

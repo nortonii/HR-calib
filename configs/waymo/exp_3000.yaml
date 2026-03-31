@@ -1,0 +1,12 @@
+parent_config: "configs/exp.yaml"
+
+exp_name: "waymo_center_3000"
+
+testing_iterations: 500
+saving_iterations: [1000, 3000]
+
+opt:
+  iterations: 3_000
+  position_lr_max_steps: 3_000
+  densify_until_iter: 2_000
+  lambda_rgb: 0.1    # Camera RGB supervision weight

@@ -1,0 +1,5 @@
+parent_config: "configs/exp_kitti_3000_cam.yaml"
+
+exp_name: "kitti_center_3000_cam_single_opa"
+
+camera_dual_opacity: False

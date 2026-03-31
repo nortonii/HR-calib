@@ -1,0 +1,35 @@
+parent_config: "configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml"
+
+exp_name: "kitti_center_1000_cam_single_opa_pose_higs_sdf_bootstrap"
+
+testing_iterations: 100
+saving_iterations: [1000]
+visual_interval: 100
+
+opt:
+  iterations: 1000
+  position_lr_max_steps: 1000
+  lambda_rgb: 0.0
+  lambda_rgb_phase: 0.0
+
+model:
+  use_pose_correction: True
+  pose_correction:
+    mode: all
+    translation_lr: 0.0002
+    rotation_lr: 0.0001
+    accumulate_steps: 1
+    stage_translation: False
+    use_gt_translation: False
+    init_translation_std: 0.0
+    init_rotation_deg: 0.0
+    init_se3: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    lambda_translation: 0.0
+    lambda_rotation: 0.0
+    sdf_loss_weight: 0.001
+    sdf_bootstrap_iterations: 1000
+    sdf_max_points: 20000
+    sdf_canny_threshold1: 100
+    sdf_canny_threshold2: 200
+    sdf_distance_clip: 64.0
+    sdf_depth_weight_power: 1.0

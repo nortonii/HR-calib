@@ -1,0 +1,14 @@
+parent_config: "configs/exp_kitti_10000_cam_single_opa_strongcam1_depth5.yaml"
+
+exp_name: "kitti_center_3000_cam_single_opa_strongcam1_depth5_coldstart"
+
+testing_iterations: 200
+saving_iterations: [1000, 3000]
+visual_interval: 500
+
+opt:
+  iterations: 3000
+  position_lr_max_steps: 3000
+  densify_from_iter: 500
+  densify_until_iter: 2000
+  densify_until_num_points: 5000000

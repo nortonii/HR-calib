@@ -1,0 +1,3 @@
+parent_config: "configs/exp_kitti_500_cam_single_opa_gtrot_t_base.yaml"
+
+exp_name: "kitti_center_500_cam_single_opa_gtrot_t_x000"

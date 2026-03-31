@@ -1,0 +1,11 @@
+parent_config: "configs/exp_kitti_3000_cam_single_opa_pose_higs_coldstart_stage2.yaml"
+
+exp_name: "kitti_center_6000_cam_single_opa_pose_higs_coldstart_stage2"
+
+testing_iterations: 200
+saving_iterations: [4000, 6000]
+visual_interval: 500
+
+opt:
+  iterations: 6000
+  position_lr_max_steps: 6000

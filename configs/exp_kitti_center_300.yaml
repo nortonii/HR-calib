@@ -1,0 +1,16 @@
+parent_config: "configs/exp.yaml"
+
+exp_name: "kitti_center_300"
+task_name: "lidar_rt"
+gpus: [1]
+
+testing_iterations: 100
+saving_iterations: [100, 200, 300]
+visual_interval: 100
+
+opt:
+  iterations: 300
+  position_lr_max_steps: 300
+
+refine:
+  use_refine: False

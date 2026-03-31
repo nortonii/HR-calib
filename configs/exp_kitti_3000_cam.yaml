@@ -1,0 +1,6 @@
+parent_config: "configs/exp_kitti_3000.yaml"
+
+exp_name: "kitti_center_3000_cam"
+
+opt:
+  lambda_rgb: 0.1    # Camera RGB supervision weight

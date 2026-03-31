@@ -1,0 +1,7 @@
+parent_config: "configs/exp_kitti_500_cam_single_opa_gtrot_t_base.yaml"
+
+exp_name: "kitti_center_500_cam_single_opa_gtrot_t_x010"
+
+model:
+  pose_correction:
+    init_se3: [0.10, 0.0, 0.0, 0.0, 0.0, 0.0]

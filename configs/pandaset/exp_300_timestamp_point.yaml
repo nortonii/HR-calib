@@ -1,0 +1,5 @@
+parent_config: "configs/pandaset/exp_300_base.yaml"
+
+exp_name: "pandaset_timestamp_point_300"
+gpus: [3]
+

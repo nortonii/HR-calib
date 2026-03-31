@@ -1,0 +1,12 @@
+parent_config: "configs/exp_kitti_6000_cam_single_opa_pose_higs_coldstart_stage2_normalinit.yaml"
+
+exp_name: "kitti_center_6000_cam_single_opa_pose_higs_coldstart_stage2_vismatch"
+
+model:
+  pose_correction:
+    update_method: vismatch
+    translation_lr: 0.0
+    rotation_lr: 0.0
+    matcher_name: matchanything-eloftr
+    matcher_update_interval: 1
+    matcher_update_blend: 1.0

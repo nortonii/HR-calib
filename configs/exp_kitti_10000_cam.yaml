@@ -1,0 +1,4 @@
+parent_config: "configs/exp_kitti_10000.yaml"
+
+opt:
+  lambda_rgb: 0.1

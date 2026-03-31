@@ -1,0 +1,7 @@
+parent_config: "configs/exp_kitti_6000_cam_single_opa_pose_higs_coldstart_stage2_vismatch.yaml"
+
+exp_name: "kitti_center_6000_cam_single_opa_pose_higs_coldstart_stage2_vismatch_roma"
+
+model:
+  pose_correction:
+    matcher_name: roma

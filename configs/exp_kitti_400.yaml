@@ -1,0 +1,16 @@
+parent_config: "configs/exp.yaml"
+
+exp_name: "kitti_depth400"
+task_name: "lidar_rt"
+gpus: [3]
+
+testing_iterations: 100
+saving_iterations: [100, 200, 300, 400]
+visual_interval: 100
+
+opt:
+  iterations: 400
+  position_lr_max_steps: 400
+
+refine:
+  use_refine: False

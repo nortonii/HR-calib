@@ -1,0 +1,11 @@
+parent_config: "configs/pandaset/exp_300_base.yaml"
+
+exp_name: "pandaset_center_rowoffset_smoke"
+gpus: [1]
+testing_iterations: 2
+saving_iterations: [2]
+visual_interval: 1
+
+opt:
+  iterations: 2
+  position_lr_max_steps: 2

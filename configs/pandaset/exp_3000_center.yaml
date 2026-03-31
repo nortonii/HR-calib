@@ -1,0 +1,11 @@
+parent_config: "configs/pandaset/exp_300_center.yaml"
+
+exp_name: "pandaset_center_3000"
+
+opt:
+  iterations: 3000
+  position_lr_max_steps: 3000
+
+testing_iterations: 500
+saving_iterations: [500, 1000, 2000, 3000]
+visual_interval: 500

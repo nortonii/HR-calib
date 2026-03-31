@@ -1,0 +1,12 @@
+parent_config: "configs/exp_kitti_3000_cam_single_opa.yaml"
+
+model:
+  use_pose_correction: True
+  pose_correction:
+    mode: all
+    translation_lr: 0.0005
+    rotation_lr: 0.0002
+    lambda_translation: 0.001
+    lambda_rotation: 0.001
+    init_translation_std: 0.0
+    init_rotation_deg: 0.0

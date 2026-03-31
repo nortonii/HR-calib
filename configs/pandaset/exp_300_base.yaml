@@ -1,0 +1,14 @@
+parent_config: "configs/exp.yaml"
+
+task_name: "lidar_rt"
+testing_iterations: 100
+saving_iterations: [100, 200, 300]
+visual_interval: 100
+
+refine:
+  use_refine: False
+
+opt:
+  iterations: 300
+  position_lr_max_steps: 300
+

@@ -1,0 +1,27 @@
+parent_config: "configs/exp_kitti_10000_cam_single_opa_strongcam1_depth5.yaml"
+
+exp_name: "kitti_center_500_cam_single_opa_gtrot_t_base"
+
+testing_iterations: 100
+saving_iterations: [500]
+visual_interval: 100
+
+opt:
+  iterations: 500
+  position_lr_max_steps: 500
+  lambda_rgb_phase: 0.0
+
+model:
+  use_pose_correction: True
+  pose_correction:
+    mode: all
+    translation_lr: 0.0
+    rotation_lr: 0.0
+    accumulate_steps: 1
+    stage_translation: False
+    use_gt_translation: False
+    init_translation_std: 0.0
+    init_rotation_deg: 0.0
+    init_se3: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    lambda_translation: 0.0
+    lambda_rotation: 0.0

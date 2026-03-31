@@ -1,0 +1,13 @@
+parent_config: "configs/exp.yaml"
+
+exp_name: "kitti_smoke"
+task_name: "lidar_rt"
+gpus: [3]
+
+testing_iterations: 2
+saving_iterations: [2]
+visual_interval: 2
+
+opt:
+  iterations: 2
+  position_lr_max_steps: 2
