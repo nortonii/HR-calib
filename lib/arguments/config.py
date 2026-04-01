@@ -59,7 +59,16 @@ cfg.optim.densify_until_iter = 15000
 cfg.optim.densify_grad_threshold = 0.0002
 cfg.optim.densify_grad_source = "lidar"
 cfg.optim.depth_supervision_interval = 1
+cfg.optim.enable_lidar_supervision = True
+cfg.optim.enable_densification = True
+cfg.optim.camera_geometry_grad_scale = 1.0
+cfg.optim.prune_nonfinite_gaussians = False
 cfg.optim.lambda_rgb_phase = 0.0
+cfg.optim.lidar_depth_use_image_visibility_weights = False
+cfg.optim.lidar_depth_visible_weight = 2.0
+cfg.optim.lidar_depth_occluded_weight = 0.5
+cfg.optim.lidar_depth_outside_weight = 1.0
+cfg.optim.lidar_depth_visibility_tolerance = 0.25
 
 # introduced by myself
 cfg.optim.max_screen_size = 20
@@ -82,6 +91,8 @@ cfg.model.use_color_correction = False
 cfg.model.color_correction = CN()
 cfg.model.color_correction.mode = 'sensor' # [image, sensor]
 cfg.model.color_correction.use_mlp = False
+cfg.model.camera_render_backend = "rasterization"
+cfg.model.freeze_gaussian_centers = False
 
 cfg.model.use_pose_correction = False
 cfg.model.pose_correction = CN()

@@ -39,6 +39,8 @@ class GaussianModel:
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
+        self._features_rgb_dc = torch.empty(0)
+        self._features_rgb_rest = torch.empty(0)
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -72,47 +74,74 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self._features_rgb_dc,
+            self._features_rgb_rest,
         )
 
     def restore(self, model_args, training_args):
-        try:
-            (self.active_sh_degree,
-            self._xyz,
-            self._features_dc,
-            self._features_rest,
-            self._scaling,
-            self._rotation,
-            self._opacity,
-            self._opacity_cam,
-            self.max_radii2D,
-            xyz_gradient_accum,
-            denom,
-            opt_dict,
-            self.spatial_lr_scale) = model_args
-        except ValueError:
-            # backward compat: old checkpoints without _opacity_cam
-            (self.active_sh_degree,
-            self._xyz,
-            self._features_dc,
-            self._features_rest,
-            self._scaling,
-            self._rotation,
-            self._opacity,
-            self.max_radii2D,
-            xyz_gradient_accum,
-            denom,
-            opt_dict,
-            self.spatial_lr_scale) = model_args
+        if len(model_args) == 15:
+            (
+                self.active_sh_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._opacity_cam,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+                self._features_rgb_dc,
+                self._features_rgb_rest,
+            ) = model_args
+        elif len(model_args) == 13:
+            (
+                self.active_sh_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._opacity_cam,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+            ) = model_args
+            self._init_rgb_from_lidar_features()
+        elif len(model_args) == 12:
+            (
+                self.active_sh_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+            ) = model_args
             self._opacity_cam = self._opacity.clone()
+            self._init_rgb_from_lidar_features()
+        else:
+            raise ValueError(f"Unsupported GaussianModel checkpoint format with {len(model_args)} entries.")
         if self.dc_only_sh:
             self.active_sh_degree = 0
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+        self._load_optimizer_state_compat(opt_dict)
         if self.dc_only_sh:
             for group in self.optimizer.param_groups:
-                if group["name"] == "f_rest":
+                if group["name"] in {"f_rest", "f_rgb_rest"}:
                     group["lr"] = 0.0
         print("Number of points of restored gaussian: ", self.get_local_xyz.shape[0])
 
@@ -155,6 +184,15 @@ class GaussianModel:
         return torch.cat((features_dc, features_rest), dim=1)
 
     @property
+    def get_camera_features(self):
+        features_dc = self._features_rgb_dc
+        if self.dc_only_sh:
+            features_rest = torch.zeros_like(self._features_rgb_rest)
+        else:
+            features_rest = self._features_rgb_rest
+        return torch.cat((features_dc, features_rest), dim=1)
+
+    @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
 
@@ -176,8 +214,150 @@ class GaussianModel:
             self.active_sh_degree = 0
         if self.optimizer is not None:
             for group in self.optimizer.param_groups:
-                if group["name"] == "f_rest":
+                if group["name"] in {"f_rest", "f_rgb_rest"}:
                     group["lr"] = 0.0 if self.dc_only_sh else group["lr"]
+
+    def freeze_positions(self, enabled=True):
+        enabled = bool(enabled)
+        self._xyz.requires_grad_(not enabled)
+        if self.optimizer is not None:
+            for group in self.optimizer.param_groups:
+                if group["name"] == "xyz":
+                    group["lr"] = 0.0 if enabled else group["lr"]
+
+    def scale_optimizer_gradients(self, scale, group_names=None):
+        if self.optimizer is None:
+            return
+        scale = float(scale)
+        if scale == 1.0:
+            return
+        if group_names is None:
+            group_names = {"xyz", "scaling", "rotation", "opacity", "opacity_cam"}
+        else:
+            group_names = set(group_names)
+        for group in self.optimizer.param_groups:
+            if group["name"] not in group_names:
+                continue
+            for param in group["params"]:
+                if param.grad is not None:
+                    param.grad.mul_(scale)
+
+    def _pointwise_nonfinite_mask(self, tensor):
+        if tensor is None:
+            return None
+        if tensor.dim() == 1:
+            flat = tensor.unsqueeze(-1)
+        else:
+            flat = tensor.reshape(tensor.shape[0], -1)
+        return ~torch.isfinite(flat).all(dim=1)
+
+    def prune_nonfinite_points(self):
+        num_points = int(self.get_local_xyz.shape[0])
+        if num_points == 0:
+            return 0
+
+        prune_mask = torch.zeros((num_points,), dtype=torch.bool, device=self.get_local_xyz.device)
+        tracked_tensors = (
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._features_rgb_dc,
+            self._features_rgb_rest,
+            self._opacity,
+            self._opacity_cam,
+            self._scaling,
+            self._rotation,
+        )
+        for tensor in tracked_tensors:
+            mask = self._pointwise_nonfinite_mask(tensor)
+            if mask is not None:
+                prune_mask |= mask
+            grad = None if tensor is None else tensor.grad
+            if grad is not None:
+                grad_mask = self._pointwise_nonfinite_mask(grad)
+                if grad_mask is not None:
+                    prune_mask |= grad_mask
+
+        prune_count = int(prune_mask.sum().item())
+        if prune_count > 0:
+            self.prune_points(prune_mask)
+        return prune_count
+
+    def sanitize_gradients(self):
+        if self.optimizer is None:
+            return
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                if param.grad is not None:
+                    torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0, out=param.grad)
+
+    def _make_rgb_feature_tensors(self, base_rgb):
+        coeff = (self.max_sh_degree + 1) ** 2
+        fused_rgb = RGB2SH(base_rgb)
+        rgb_features = torch.zeros(
+            (fused_rgb.shape[0], 3, coeff),
+            dtype=fused_rgb.dtype,
+            device=fused_rgb.device,
+        )
+        rgb_features[:, :3, 0] = fused_rgb
+        rgb_dc = rgb_features[:, :, 0:1].transpose(1, 2).contiguous()
+        rgb_rest = rgb_features[:, :, 1:].transpose(1, 2).contiguous()
+        return rgb_dc, rgb_rest
+
+    def _init_rgb_from_lidar_features(self):
+        if self._features_dc.numel() == 0:
+            self._features_rgb_dc = torch.empty_like(self._features_dc)
+            self._features_rgb_rest = torch.empty_like(self._features_rest)
+            return
+        intensity_dc = self._features_dc[..., 0:1].repeat(1, 1, 3).contiguous()
+        rgb_rest = torch.zeros(
+            (self._features_rest.shape[0], self._features_rest.shape[1], 3),
+            dtype=self._features_rest.dtype,
+            device=self._features_rest.device,
+        )
+        self._features_rgb_dc = intensity_dc
+        self._features_rgb_rest = rgb_rest
+
+    def _load_optimizer_state_compat(self, opt_dict):
+        if self.optimizer is None or opt_dict is None:
+            return
+        try:
+            self.optimizer.load_state_dict(opt_dict)
+            return
+        except Exception:
+            pass
+
+        loaded_state = opt_dict.get("state", {})
+        current_groups = {group["name"]: group for group in self.optimizer.param_groups}
+        for loaded_group in opt_dict.get("param_groups", []):
+            name = loaded_group.get("name")
+            if name not in current_groups or len(loaded_group.get("params", [])) == 0:
+                continue
+            current_group = current_groups[name]
+            current_group["lr"] = loaded_group.get("lr", current_group["lr"])
+            for hyper_name in ("betas", "eps", "weight_decay", "amsgrad"):
+                if hyper_name in loaded_group:
+                    current_group[hyper_name] = loaded_group[hyper_name]
+            loaded_param_id = loaded_group["params"][0]
+            loaded_param_state = loaded_state.get(loaded_param_id)
+            if loaded_param_state is None:
+                continue
+            current_param = current_group["params"][0]
+            copied_state = {}
+            state_is_compatible = True
+            for key, value in loaded_param_state.items():
+                if torch.is_tensor(value):
+                    if value.shape != current_param.shape:
+                        state_is_compatible = False
+                        break
+                    copied_state[key] = value.to(
+                        device=current_param.device,
+                        dtype=current_param.dtype,
+                    )
+                else:
+                    copied_state[key] = value
+            if state_is_compatible:
+                self.optimizer.state[current_param] = copied_state
 
     def create_from_pcd(self, pcd, use_normals=False):
         self.spatial_lr_scale = self.extent
@@ -188,6 +368,8 @@ class GaussianModel:
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
+        base_rgb = color_intensity[:, :1].repeat(1, 3)
+        features_rgb_dc, features_rgb_rest = self._make_rgb_feature_tensors(base_rgb)
 
         print("Number of points at initialization: ", fused_point_cloud.shape[0])
 
@@ -205,6 +387,8 @@ class GaussianModel:
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rgb_dc = nn.Parameter(features_rgb_dc.requires_grad_(True))
+        self._features_rgb_rest = nn.Parameter(features_rgb_rest.requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
@@ -217,11 +401,19 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_local_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_local_xyz.shape[0], 1), device="cuda")
         rest_lr = 0.0 if self.dc_only_sh else training_args.feature_lr / 20.0
+        if self._features_rgb_dc.numel() == 0 or self._features_rgb_rest.numel() == 0:
+            self._init_rgb_from_lidar_features()
+        if not isinstance(self._features_rgb_dc, nn.Parameter):
+            self._features_rgb_dc = nn.Parameter(self._features_rgb_dc.requires_grad_(True))
+        if not isinstance(self._features_rgb_rest, nn.Parameter):
+            self._features_rgb_rest = nn.Parameter(self._features_rgb_rest.requires_grad_(True))
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': rest_lr, "name": "f_rest"},
+            {'params': [self._features_rgb_dc], 'lr': training_args.feature_lr, "name": "f_rgb_dc"},
+            {'params': [self._features_rgb_rest], 'lr': rest_lr, "name": "f_rgb_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._opacity_cam], 'lr': training_args.opacity_lr, "name": "opacity_cam"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
@@ -287,6 +479,8 @@ class GaussianModel:
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
+        self._features_rgb_dc = optimizable_tensors["f_rgb_dc"]
+        self._features_rgb_rest = optimizable_tensors["f_rgb_rest"]
         self._opacity = optimizable_tensors["opacity"]
         self._opacity_cam = optimizable_tensors["opacity_cam"]
         self._scaling = optimizable_tensors["scaling"]
@@ -319,10 +513,12 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_opacities_cam, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_features_rgb_dc, new_features_rgb_rest, new_opacities, new_opacities_cam, new_scaling, new_rotation):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
+        "f_rgb_dc": new_features_rgb_dc,
+        "f_rgb_rest": new_features_rgb_rest,
         "opacity": new_opacities,
         "opacity_cam": new_opacities_cam,
         "scaling" : new_scaling,
@@ -332,6 +528,8 @@ class GaussianModel:
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
+        self._features_rgb_dc = optimizable_tensors["f_rgb_dc"]
+        self._features_rgb_rest = optimizable_tensors["f_rgb_rest"]
         self._opacity = optimizable_tensors["opacity"]
         self._opacity_cam = optimizable_tensors["opacity_cam"]
         self._scaling = optimizable_tensors["scaling"]
@@ -362,10 +560,12 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
+        new_features_rgb_dc = self._features_rgb_dc[selected_pts_mask].repeat(N,1,1)
+        new_features_rgb_rest = self._features_rgb_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_opacity_cam = self._opacity_cam[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_opacity_cam, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_features_rgb_dc, new_features_rgb_rest, new_opacity, new_opacity_cam, new_scaling, new_rotation)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -380,12 +580,14 @@ class GaussianModel:
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
+        new_features_rgb_dc = self._features_rgb_dc[selected_pts_mask]
+        new_features_rgb_rest = self._features_rgb_rest[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
         new_opacities_cam = self._opacity_cam[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_opacities_cam, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_features_rgb_dc, new_features_rgb_rest, new_opacities, new_opacities_cam, new_scaling, new_rotation)
         return num
 
     def densify_and_prune(self, opt, min_opacity, max_screen_size):

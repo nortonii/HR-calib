@@ -32,7 +32,7 @@ from lib.dataloader.kitti_calib_loader import (
     load_kitti_calib_cameras,
 )
 from lib.gaussian_renderer import raytracing
-from lib.gaussian_renderer.camera_render import render_camera_3dgs
+from lib.gaussian_renderer.camera_render import render_camera
 from lib.scene import Scene
 from lib.scene.camera_pose_correction import CameraPoseCorrection
 from lib.scene.unet import UNet
@@ -226,6 +226,85 @@ def _pose_sdf_alignment_loss(camera, sdf_map, points_world, distance_clip, depth
     return sampled_sdf.mean()
 
 
+def _build_lidar_depth_image_visibility_weight_map(
+    lidar_sensor,
+    frame_id,
+    camera,
+    visible_weight,
+    occluded_weight,
+    outside_weight,
+    visibility_tolerance,
+):
+    depth_map = lidar_sensor.get_depth(frame_id)
+    valid_mask = lidar_sensor.get_mask(frame_id)
+    if not torch.is_tensor(depth_map):
+        depth_map = torch.as_tensor(depth_map, dtype=torch.float32)
+    if not torch.is_tensor(valid_mask):
+        valid_mask = torch.as_tensor(valid_mask, dtype=torch.bool)
+    valid_mask = valid_mask.bool()
+    weight_map = torch.full_like(depth_map, float(outside_weight), dtype=torch.float32)
+    if not torch.any(valid_mask):
+        return weight_map
+
+    camera = camera.cuda()
+    points_world = lidar_sensor.range2point(frame_id, depth_map).reshape(-1, 3)
+    flat_valid = valid_mask.reshape(-1)
+    points_world = points_world[flat_valid].to(device="cuda", dtype=torch.float32)
+    points_camera = points_world @ camera.R + camera.T
+    camera_depths = points_camera[:, 2]
+
+    fx = camera.image_width / (
+        2.0 * torch.tan(torch.tensor(camera.FoVx * 0.5, device=points_world.device, dtype=points_world.dtype))
+    )
+    fy = camera.image_height / (
+        2.0 * torch.tan(torch.tensor(camera.FoVy * 0.5, device=points_world.device, dtype=points_world.dtype))
+    )
+    cx = (camera.image_width - 1.0) * 0.5
+    cy = (camera.image_height - 1.0) * 0.5
+
+    uv = torch.zeros((points_world.shape[0], 2), device=points_world.device, dtype=points_world.dtype)
+    uv[:, 0] = fx * (points_camera[:, 0] / camera_depths.clamp_min(1.0e-8)) + cx
+    uv[:, 1] = fy * (points_camera[:, 1] / camera_depths.clamp_min(1.0e-8)) + cy
+    in_image = (
+        (camera_depths > 1.0e-6)
+        & (uv[:, 0] >= 0.0)
+        & (uv[:, 0] < camera.image_width)
+        & (uv[:, 1] >= 0.0)
+        & (uv[:, 1] < camera.image_height)
+    )
+    if not torch.any(in_image):
+        return weight_map
+
+    uv_in = uv[in_image].to(torch.long)
+    depth_in = camera_depths[in_image]
+    flat_idx = uv_in[:, 1] * int(camera.image_width) + uv_in[:, 0]
+    min_depth = torch.full(
+        (int(camera.image_width) * int(camera.image_height),),
+        float("inf"),
+        device=points_world.device,
+        dtype=points_world.dtype,
+    )
+    min_depth.scatter_reduce_(0, flat_idx, depth_in, reduce="amin", include_self=True)
+    visible_in = depth_in <= (min_depth[flat_idx] + float(visibility_tolerance))
+
+    projected_weights = torch.full(
+        (points_world.shape[0],),
+        float(outside_weight),
+        device=points_world.device,
+        dtype=torch.float32,
+    )
+    projected_weights[in_image] = float(occluded_weight)
+    projected_weights[in_image] = torch.where(
+        visible_in,
+        torch.full_like(depth_in, float(visible_weight)),
+        projected_weights[in_image],
+    )
+
+    weight_map_flat = weight_map.reshape(-1)
+    weight_map_flat[flat_valid] = projected_weights.detach().cpu()
+    return weight_map
+
+
 def _pose_sdf_alignment_loss_kitti_calib(
     pose_correction,
     frame_id,
@@ -306,6 +385,14 @@ def _save_pose_correction(model_dir, model_name, pose_correction, pose_optimizer
     torch.save(state, os.path.join(model_dir, model_name + "_pose.pth"))
 
 
+def _apply_gaussian_training_constraints(scene, args):
+    freeze_centers = bool(getattr(args.model, "freeze_gaussian_centers", False))
+    if freeze_centers:
+        for gaussians in scene.gaussians_assets:
+            gaussians.freeze_positions(True)
+        print(blue("[Gaussian] Freezing Gaussian centers: xyz positions will remain fixed during training."))
+
+
 def training(args):
     first_iter = 0
 
@@ -334,22 +421,48 @@ def training(args):
     lambda_rgb = getattr(args.opt, "lambda_rgb", 0.0)
     lambda_rgb_dssim = getattr(args.opt, "lambda_rgb_dssim", 0.2)  # SSIM weight
     lambda_rgb_phase = getattr(args.opt, "lambda_rgb_phase", 0.0)
+    camera_geometry_grad_scale = float(getattr(args.opt, "camera_geometry_grad_scale", 1.0))
+    lambda_depth_l1 = float(getattr(args.opt, "lambda_depth_l1", 0.0))
+    enable_lidar_supervision = bool(getattr(args.opt, "enable_lidar_supervision", True))
+    enable_densification = bool(getattr(args.opt, "enable_densification", True))
+    use_lidar_depth_image_visibility_weights = bool(
+        getattr(args.opt, "lidar_depth_use_image_visibility_weights", False)
+    )
+    lidar_depth_visible_weight = float(getattr(args.opt, "lidar_depth_visible_weight", 2.0))
+    lidar_depth_occluded_weight = float(getattr(args.opt, "lidar_depth_occluded_weight", 0.5))
+    lidar_depth_outside_weight = float(getattr(args.opt, "lidar_depth_outside_weight", 1.0))
+    lidar_depth_visibility_tolerance = float(
+        getattr(args.opt, "lidar_depth_visibility_tolerance", 0.25)
+    )
     model_cfg = getattr(args, "model", None)
     pose_cfg = getattr(model_cfg, "pose_correction", None) if model_cfg is not None else None
     pose_sdf_weight = float(getattr(pose_cfg, "sdf_loss_weight", 0.0)) if pose_cfg is not None else 0.0
     is_kitti_family = "kitti" in _dtype.lower().replace("-", "").replace("_", "")
     camera_requested = (camera_id >= 0) or is_kitti_family
+    need_camera_data = camera_requested and (
+        (lambda_rgb > 0.0)
+        or (pose_sdf_weight > 0.0)
+        or use_lidar_depth_image_visibility_weights
+    )
     use_camera_supervision = camera_requested and ((lambda_rgb > 0.0) or (pose_sdf_weight > 0.0))
+    if lambda_rgb > 0.0:
+        print(
+            blue(
+                "[Camera] RGB supervision uses a separate camera RGB SH branch; "
+                "LiDAR [intensity, hit_prob, drop_prob] features remain unchanged."
+            )
+        )
     use_pose_correction = use_camera_supervision and bool(
         getattr(model_cfg, "use_pose_correction", False)
     )
+    lidar_depth_loss_weight_maps = {}
     pose_sdf_maps = {}
     pose_sdf_points = {}
     pose_sdf_projection_meta = {"mode": "generic_world", "intrinsics": None}
     pose_sdf_bootstrap_iterations = 0
     pose_sdf_distance_clip = 64.0
     pose_sdf_depth_weight_power = 1.0
-    if use_camera_supervision:
+    if need_camera_data:
         if "waymo" in _dtype.lower():
             print(blue(f"[Camera] Loading Waymo camera {camera_id} at 1/{camera_scale} scale ..."))
             cam_cameras, cam_images = waymo_loader.load_waymo_cameras(
@@ -391,6 +504,28 @@ def training(args):
         else:
             print(red(f"[Camera] Camera supervision not implemented for dataset type '{_dtype}'. Disabling."))
             use_camera_supervision = False
+            need_camera_data = False
+
+    if use_lidar_depth_image_visibility_weights and cam_cameras:
+        print(
+            blue(
+                "[LiDAR] Image-visibility weighted depth loss enabled "
+                f"(visible={lidar_depth_visible_weight:.2f}, "
+                f"occluded={lidar_depth_occluded_weight:.2f}, "
+                f"outside={lidar_depth_outside_weight:.2f}, "
+                f"tol={lidar_depth_visibility_tolerance:.2f}m)"
+            )
+        )
+        for frame_id, camera in cam_cameras.items():
+            lidar_depth_loss_weight_maps[frame_id] = _build_lidar_depth_image_visibility_weight_map(
+                scene.train_lidar,
+                frame_id,
+                camera,
+                lidar_depth_visible_weight,
+                lidar_depth_occluded_weight,
+                lidar_depth_outside_weight,
+                lidar_depth_visibility_tolerance,
+            )
 
     pose_correction = None
     pose_optimizer = None
@@ -550,6 +685,18 @@ def training(args):
             with open(log_path, "r") as json_file:
                 log = json.load(json_file)
     print("Continuing from iteration ", first_iter)
+    _apply_gaussian_training_constraints(scene, args)
+    if not enable_lidar_supervision:
+        print(blue("[LiDAR] LiDAR supervision disabled: skipping LiDAR ray tracing and LiDAR depth loss during training."))
+    if not enable_densification:
+        print(blue("[Gaussian] Densification disabled: clone/split/prune and opacity reset are frozen."))
+    if camera_geometry_grad_scale != 1.0:
+        print(
+            blue(
+                "[Camera] Scaling camera-loss gradients on Gaussian geometry "
+                f"(xyz/scale/rotation/opacity) by {camera_geometry_grad_scale:.3f}."
+            )
+        )
 
     # bg_color = [1, 1, 1] if args.model.white_background else [0, 0, 0]
     background = torch.tensor(
@@ -594,7 +741,9 @@ def training(args):
             args.pipe.debug = True
 
         densify_grad_source = str(getattr(args.opt, "densify_grad_source", "lidar")).lower()
-        do_depth_supervision = (depth_supervision_interval <= 1) or (((iteration - 1) % depth_supervision_interval) == 0)
+        do_depth_supervision = enable_lidar_supervision and (lambda_depth_l1 > 0.0) and (
+            (depth_supervision_interval <= 1) or (((iteration - 1) % depth_supervision_interval) == 0)
+        )
         densify_mean_grads = None
         densify_update_filter = None
         depth = None
@@ -622,9 +771,27 @@ def training(args):
 
             depth = depth.squeeze(-1)
             gt_depth = scene.train_lidar.get_depth(frame).cuda()
-            loss_depth = args.opt.lambda_depth_l1 * l1_loss(
-                depth[static_mask], gt_depth[static_mask]
-            )
+            if use_lidar_depth_image_visibility_weights and frame in lidar_depth_loss_weight_maps:
+                depth_weights = lidar_depth_loss_weight_maps[frame].cuda()
+                supervised_mask = static_mask & (depth_weights > 0.0)
+                if torch.any(supervised_mask):
+                    depth_residual = torch.abs(depth[supervised_mask] - gt_depth[supervised_mask])
+                    supervised_weights = depth_weights[supervised_mask]
+                    loss_depth = lambda_depth_l1 * (
+                        (depth_residual * supervised_weights).sum()
+                        / supervised_weights.sum().clamp_min(1.0e-8)
+                    )
+                    visible_mask = supervised_mask & (depth_weights == float(lidar_depth_visible_weight))
+                    lidar_depth_visible_ratio = (
+                        visible_mask.float().sum()
+                        / supervised_mask.float().sum().clamp_min(1.0)
+                    )
+                else:
+                    loss_depth = torch.tensor(0.0, device="cuda")
+            else:
+                loss_depth = lambda_depth_l1 * l1_loss(
+                    depth[static_mask], gt_depth[static_mask]
+                )
         else:
             batch_time = time.time() - end
             loss_depth = torch.tensor(0.0, device="cuda")
@@ -669,6 +836,7 @@ def training(args):
         pose_match_reproj_error = torch.tensor(0.0, device="cuda")
         pose_match_success_ratio = torch.tensor(0.0, device="cuda")
         pose_match_best_frame = torch.tensor(-1.0, device="cuda")
+        lidar_depth_visible_ratio = torch.tensor(0.0, device="cuda")
         visual_cam_depth_match = None
         visual_cam_depth_match_gt = None
         if pose_optimizer is not None and pose_accum_counter == 0:
@@ -689,12 +857,13 @@ def training(args):
                         )
                         match_gt_rgb = cam_images[match_frame].cuda()
                         with torch.no_grad():
-                            match_render = render_camera_3dgs(
+                            match_render = render_camera(
                                 match_camera,
                                 gaussians_assets,
                                 args,
                                 cam_rotation=match_corrected_camera.R.detach(),
                                 cam_translation=match_corrected_camera.T.detach(),
+                                require_rgb=False,
                             )
                         pose_match_frame = pose_matcher.estimate_relative_pose(
                             match_render["depth"],
@@ -767,9 +936,10 @@ def training(args):
                 gt_rgb = cam_images[frame].cuda()
             total_camera_loss = pose_reg
             if lambda_rgb > 0.0:
-                cam_render = render_camera_3dgs(
+                cam_render = render_camera(
                     camera, gaussians_assets, args,
-                    cam_rotation=pose_rotation, cam_translation=pose_translation
+                    cam_rotation=pose_rotation, cam_translation=pose_translation,
+                    require_rgb=True,
                 )
                 pred_rgb = cam_render["rgb"].clamp(0.0, 1.0)  # (H, W, 3)
                 if cam_render["num_visible"] > 0:
@@ -819,9 +989,16 @@ def training(args):
                 total_camera_loss = total_camera_loss + loss_pose_sdf
             if total_camera_loss.requires_grad:
                 total_camera_loss.backward()
+                if camera_geometry_grad_scale != 1.0:
+                    # Scale only the Gaussian parameter grads coming from the camera loss.
+                    # Pose-correction grads are left untouched because they have already
+                    # been written to pose_correction.*.grad by backward().
+                    for gaussians in gaussians_assets:
+                        gaussians.scale_optimizer_gradients(camera_geometry_grad_scale)
                 if pose_optimizer is not None:
                     if not pose_translation_enabled and pose_correction.delta_translations.grad is not None:
                         pose_correction.delta_translations.grad.zero_()
+                    pose_correction.sanitize_gradients()
                     pose_accum_counter += 1
                     grad_divisor = float(pose_accum_counter)
                     if pose_correction.delta_translations.grad is not None:
@@ -842,6 +1019,11 @@ def training(args):
                                 if group.get("name") == "camera_translation":
                                     group["lr"] = 0.0
                         pose_optimizer.step()
+                        sanitized_pose_num = pose_correction.sanitize_parameters()
+                        if sanitized_pose_num > 0:
+                            progress_bar.write(
+                                red(f"[ITER {iteration}] Sanitized {sanitized_pose_num} non-finite pose parameters.")
+                            )
                         pose_optimizer.zero_grad(set_to_none=True)
                         pose_accum_counter = 0
                 torch.cuda.synchronize()
@@ -886,6 +1068,7 @@ def training(args):
             densify_info = scene.optimize(
                 args, iteration, densify_mean_grads, densify_update_filter, None, None
             )
+            prune_nonfinite_num = densify_info[4] if len(densify_info) > 4 else 0
 
             points_num = 0
             for i in gaussians_assets:
@@ -914,6 +1097,10 @@ def training(args):
                 if log["prune_opacity_sum"]
                 else densify_info[3]
             )
+            if prune_nonfinite_num > 0:
+                progress_bar.write(
+                    red(f"[ITER {iteration}] Pruned {prune_nonfinite_num} non-finite Gaussian primitives.")
+                )
             log["depth_rmse"].append(depth_mse)
             log["points_num"].append(points_num)
             log["clone_sum"].append(clone_sum)
@@ -932,9 +1119,10 @@ def training(args):
                 else:
                     vis_rotation, vis_translation = None, None
                 gt_cam_tensor = cam_images[frame].cuda()
-                cam_r = render_camera_3dgs(
+                cam_r = render_camera(
                     cam_vis, gaussians_assets, args,
-                    cam_rotation=vis_rotation, cam_translation=vis_translation
+                    cam_rotation=vis_rotation, cam_translation=vis_translation,
+                    require_rgb=True,
                 )
                 pred_cam_tensor = cam_r["rgb"].clamp(0, 1)
                 if cam_r["num_visible"] > 0:
@@ -979,6 +1167,7 @@ def training(args):
                 "cam_pose_match_reproj_error": pose_match_reproj_error,
                 "cam_pose_match_success_ratio": pose_match_success_ratio,
                 "cam_pose_match_best_frame": pose_match_best_frame,
+                "lidar_depth_visible_ratio": lidar_depth_visible_ratio,
                 "ema_loss": 0.4 * loss + 0.6 * ema_loss_for_log,
                 "points_num": torch.tensor(points_num).float(),
                 "depth_rmse": torch.tensor(depth_mse).float(),

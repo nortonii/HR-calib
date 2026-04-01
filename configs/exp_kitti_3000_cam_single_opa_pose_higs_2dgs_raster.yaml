@@ -1,0 +1,11 @@
+parent_config: "configs/exp_kitti_3000_cam_single_opa_pose_higs.yaml"
+
+exp_name: "kitti_center_3000_cam_single_opa_pose_higs_2dgs_raster"
+detect_anomaly: False
+
+model:
+  camera_render_backend: surfel_rasterization
+
+opt:
+  camera_geometry_grad_scale: 0.1
+  prune_nonfinite_gaussians: True

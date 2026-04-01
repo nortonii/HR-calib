@@ -303,6 +303,7 @@ class SceneLidar(Scene):
     ):
 
         clone_num, split_num, prune_scale_num, prune_opacity_num = 0, 0, 0, 0
+        prune_nonfinite_num = 0
 
         begin_index = 0
         for gaussians in self.gaussians_assets:
@@ -318,7 +319,7 @@ class SceneLidar(Scene):
             begin_index += points_num
 
             # Densification
-            if iteration < args.opt.densify_until_iter:
+            if bool(getattr(args.opt, "enable_densification", True)) and iteration < args.opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 # gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 if instance_mean_grads is not None and instance_accum_weights is not None:
@@ -349,7 +350,10 @@ class SceneLidar(Scene):
 
             # args.optimizer step
             if iteration < args.opt.iterations:
+                if bool(getattr(args.opt, "prune_nonfinite_gaussians", False)):
+                    prune_nonfinite_num += gaussians.prune_nonfinite_points()
+                    gaussians.sanitize_gradients()
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
 
-        return clone_num, split_num, prune_scale_num, prune_opacity_num
+        return clone_num, split_num, prune_scale_num, prune_opacity_num, prune_nonfinite_num

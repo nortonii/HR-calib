@@ -15,6 +15,8 @@ model:
   obj_pt_num: 10_000
   dimension: 2
   sh_degree: 3
+  camera_render_backend: rasterization  # Camera render backend: rasterization (3DGS), surfel_rasterization (2DGS), or raytracing.
+  freeze_gaussian_centers: False  # Keep Gaussian centers fixed during optimization while allowing other parameters to update.
 
 opt:
   iterations: 30_000
@@ -44,6 +46,15 @@ opt:
   lambda_rgb: 0.0    # Camera RGB supervision weight (0=disabled; set > 0 with --camera_id)
   lambda_rgb_dssim: 0.2  # SSIM weight in camera loss: (1-λ)*L1 + λ*(1-SSIM)
   lambda_rgb_phase: 0.0  # Optional phase-only FFT alignment loss for camera supervision
+  camera_geometry_grad_scale: 1.0  # Multiplier applied after camera backward only to Gaussian xyz/scale/rotation/opacity grads; pose-correction grads stay unchanged, so this acts like a camera-only effective LR reduction on geometry without weakening LiDAR updates.
+  prune_nonfinite_gaussians: False  # If True, prune Gaussian primitives whose parameters or gradients become NaN/Inf before the optimizer step, then zero any remaining non-finite grads.
+  enable_lidar_supervision: True  # If False, skip LiDAR ray tracing and LiDAR depth supervision entirely during training.
+  enable_densification: True  # If False, disable clone/split/prune/opacity-reset densification updates and keep primitive count fixed.
+  lidar_depth_use_image_visibility_weights: False  # Weight LiDAR depth loss by whether each LiDAR ray projects to a likely-visible camera pixel.
+  lidar_depth_visible_weight: 2.0  # Weight for LiDAR rays that project inside the image and are front-most at that image pixel.
+  lidar_depth_occluded_weight: 0.5  # Weight for LiDAR rays that project inside the image but are behind another projected LiDAR point.
+  lidar_depth_outside_weight: 1.0  # Weight for LiDAR rays outside the camera image or behind the camera.
+  lidar_depth_visibility_tolerance: 0.25  # Camera-depth tolerance (meters) for treating multiple projected LiDAR points as jointly visible.
   use_rayhit: True
 
   use_normal_init: True

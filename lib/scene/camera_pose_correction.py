@@ -243,6 +243,22 @@ class CameraPoseCorrection(nn.Module):
         )
         self.use_gt_translation = False
 
+    def sanitize_gradients(self):
+        for param in (self.delta_translations, self.delta_rotations_6d):
+            if param.grad is not None:
+                torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0, out=param.grad)
+
+    @torch.no_grad()
+    def sanitize_parameters(self):
+        sanitized = 0
+        for param in (self.delta_translations, self.delta_rotations_6d):
+            nonfinite = ~torch.isfinite(param)
+            count = int(nonfinite.sum().item())
+            if count > 0:
+                sanitized += count
+                torch.nan_to_num(param, nan=0.0, posinf=0.0, neginf=0.0, out=param)
+        return sanitized
+
     def _frame_index(self, frame_id: int) -> int:
         frame_id = int(frame_id)
         if frame_id not in self.frame_to_index:
