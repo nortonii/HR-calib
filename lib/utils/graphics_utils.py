@@ -10,6 +10,7 @@
 #
 
 import torch
+import torch.nn.functional as F
 import math
 import numpy as np
 from typing import NamedTuple
@@ -98,6 +99,28 @@ def get_rays(K, c2w):
     rays_d = dirs @ c2w.T[:3, :3]
     rays_o = c2w[:3, -1].expand(rays_d.shape)
     return rays_o.cuda().contiguous(), rays_d.cuda()
+
+
+def camera_to_rays(sensor):
+    """Generate per-pixel ray origins and directions from a Camera object."""
+    c2w = (sensor.world_view_transform.T).inverse()
+    W, H = sensor.image_width, sensor.image_height
+    ndc2pix = torch.tensor([
+        [W / 2, 0, 0, W / 2],
+        [0, H / 2, 0, H / 2],
+        [0, 0, 0, 1]], dtype=torch.float32, device='cuda').T
+    projection_matrix = c2w.T @ sensor.full_proj_transform
+    intrins = (projection_matrix @ ndc2pix)[:3, :3].T
+
+    grid_x, grid_y = torch.meshgrid(
+        torch.arange(W, device='cuda').float(),
+        torch.arange(H, device='cuda').float(),
+        indexing='xy')
+    pixels = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(-1, 3)
+    rays_d = pixels @ intrins.inverse().T @ c2w[:3, :3].T
+    rays_d = F.normalize(rays_d, dim=-1)
+    rays_o = c2w[:3, 3].expand(rays_d.shape)
+    return rays_o.contiguous(), rays_d.contiguous()
 
 def image2point(depthmap, sensor):
     c2w = (sensor.world_view_transform.T).inverse()

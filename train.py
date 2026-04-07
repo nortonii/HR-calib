@@ -24,7 +24,6 @@ import torch.nn.functional as F
 import yaml
 from lib import dataloader
 from lib.arguments import parse
-from lib.dataloader import waymo_loader
 from lib.dataloader.kitti_loader import load_kitti360_cameras
 from lib.dataloader.kitti_calib_loader import (
     _parse_kitti_calib_file,
@@ -52,8 +51,11 @@ from ruamel.yaml import YAML
 from tqdm import tqdm
 
 try:
-    from torch.utils.tensorboard import SummaryWriter
-
+    # Prefer tensorboardX (doesn't import TensorFlow) over torch.utils.tensorboard
+    try:
+        from tensorboardX import SummaryWriter
+    except ImportError:
+        from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
@@ -464,6 +466,7 @@ def training(args):
     pose_sdf_depth_weight_power = 1.0
     if need_camera_data:
         if "waymo" in _dtype.lower():
+            from lib.dataloader import waymo_loader
             print(blue(f"[Camera] Loading Waymo camera {camera_id} at 1/{camera_scale} scale ..."))
             cam_cameras, cam_images = waymo_loader.load_waymo_cameras(
                 args.source_dir, args, camera_id=camera_id, scale=camera_scale
@@ -563,7 +566,7 @@ def training(args):
                         "name": "camera_translation",
                     },
                     {
-                        "params": [pose_correction.delta_rotations_6d],
+                        "params": [pose_correction.delta_rotations_quat],
                         "lr": float(getattr(pose_cfg, "rotation_lr", 2.0e-4)),
                         "name": "camera_rotation",
                     },
@@ -1005,9 +1008,9 @@ def training(args):
                         pose_translation_grad_norm = (
                             pose_correction.delta_translations.grad.norm() / grad_divisor
                         ).detach()
-                    if pose_correction.delta_rotations_6d.grad is not None:
+                    if pose_correction.delta_rotations_quat.grad is not None:
                         pose_rotation_grad_norm = (
-                            pose_correction.delta_rotations_6d.grad.norm() / grad_divisor
+                            pose_correction.delta_rotations_quat.grad.norm() / grad_divisor
                         ).detach()
                     if pose_accum_counter >= pose_accum_steps or iteration == args.opt.iterations:
                         for group in pose_optimizer.param_groups:
@@ -1024,6 +1027,8 @@ def training(args):
                             progress_bar.write(
                                 red(f"[ITER {iteration}] Sanitized {sanitized_pose_num} non-finite pose parameters.")
                             )
+                        # Fold delta quaternion into base (update_extrinsics paradigm)
+                        pose_correction.update_extrinsics()
                         pose_optimizer.zero_grad(set_to_none=True)
                         pose_accum_counter = 0
                 torch.cuda.synchronize()

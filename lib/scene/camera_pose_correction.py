@@ -21,6 +21,48 @@ def _matrix_to_rotation_6d(rotation: torch.Tensor) -> torch.Tensor:
     return torch.cat((rotation[..., :, 0], rotation[..., :, 1]), dim=-1)
 
 
+# ─── Quaternion utilities [w, x, y, z] — sensor_trajectories.py paradigm ─────
+
+def _quaternion_to_matrix(q: torch.Tensor) -> torch.Tensor:
+    """(4,) quaternion [w,x,y,z] → (3,3) rotation matrix."""
+    q = F.normalize(q.float(), dim=-1)
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    # Handle both batched (..., 4) and single (4,) inputs
+    mat = torch.stack([
+        torch.stack([1 - 2*(y*y + z*z),   2*(x*y - w*z),   2*(x*z + w*y)], dim=-1),
+        torch.stack([  2*(x*y + w*z), 1 - 2*(x*x + z*z),   2*(y*z - w*x)], dim=-1),
+        torch.stack([  2*(x*z - w*y),   2*(y*z + w*x), 1 - 2*(x*x + y*y)], dim=-1),
+    ], dim=-2)
+    return mat
+
+
+def _matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
+    """(3,3) rotation matrix → (4,) quaternion [w,x,y,z] (Shepperd / eigenmethod)."""
+    R = R.float()
+    K = torch.stack([
+        torch.stack([R[0,0]-R[1,1]-R[2,2], R[1,0]+R[0,1], R[2,0]+R[0,2], R[2,1]-R[1,2]]),
+        torch.stack([R[1,0]+R[0,1], R[1,1]-R[0,0]-R[2,2], R[2,1]+R[1,2], R[0,2]-R[2,0]]),
+        torch.stack([R[2,0]+R[0,2], R[2,1]+R[1,2], R[2,2]-R[0,0]-R[1,1], R[1,0]-R[0,1]]),
+        torch.stack([R[2,1]-R[1,2], R[0,2]-R[2,0], R[1,0]-R[0,1], R[0,0]+R[1,1]+R[2,2]]),
+    ]) / 3.0
+    _, v = torch.linalg.eigh(K)
+    q_xyzw = v[:, -1]
+    q = torch.stack([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
+    return q if q[0] >= 0 else -q
+
+
+def _quaternion_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """Hamilton product q1 ⊗ q2  [w,x,y,z].  Applies q2 first, then q1."""
+    w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+    w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+    return torch.stack([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dim=-1)
+
+
 def _matrix_to_euler_xyz(rotation: torch.Tensor) -> torch.Tensor:
     sy = torch.sqrt(rotation[..., 0, 0] ** 2 + rotation[..., 1, 0] ** 2)
     singular = sy < 1.0e-6
@@ -236,22 +278,31 @@ class CameraPoseCorrection(nn.Module):
             self.register_buffer("gt_lidar_to_camera_translation", gt_extrinsic_translation.unsqueeze(0))
             self.register_buffer("base_lidar_to_camera_rotation", base_extrinsic_rotation.unsqueeze(0))
             self.register_buffer("base_lidar_to_camera_translation", base_extrinsic_translation.unsqueeze(0))
+            # Quaternion buffer for the base extrinsic rotation (delta paradigm)
+            self.register_buffer(
+                "base_lidar_to_camera_quat",
+                _matrix_to_quaternion(base_extrinsic_rotation).unsqueeze(0).to(dtype=dtype),
+            )
 
+        # ── Learnable delta parameters (quaternion-delta paradigm) ──────────
+        # delta_rotations_quat: [N, 4] quaternion [w,x,y,z], initialised to identity [1,0,0,0]
+        # Effective rotation = quat_multiply(normalize(delta_q), base_q)
+        # After each training step call update_extrinsics() to fold delta into base.
         self.delta_translations = nn.Parameter(torch.zeros((num_pose_params, 3), dtype=dtype))
-        self.delta_rotations_6d = nn.Parameter(
-            _matrix_to_rotation_6d(torch.eye(3, dtype=dtype).unsqueeze(0).repeat(num_pose_params, 1, 1))
-        )
+        identity_q = torch.zeros((num_pose_params, 4), dtype=dtype)
+        identity_q[:, 0] = 1.0   # [w=1, x=0, y=0, z=0]
+        self.delta_rotations_quat = nn.Parameter(identity_q)
         self.use_gt_translation = False
 
     def sanitize_gradients(self):
-        for param in (self.delta_translations, self.delta_rotations_6d):
+        for param in (self.delta_translations, self.delta_rotations_quat):
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0, out=param.grad)
 
     @torch.no_grad()
     def sanitize_parameters(self):
         sanitized = 0
-        for param in (self.delta_translations, self.delta_rotations_6d):
+        for param in (self.delta_translations, self.delta_rotations_quat):
             nonfinite = ~torch.isfinite(param)
             count = int(nonfinite.sum().item())
             if count > 0:
@@ -280,21 +331,25 @@ class CameraPoseCorrection(nn.Module):
 
         if self.use_shared_lidar_extrinsic:
             delta_translation = self.delta_translations[pose_index].to(device=device)
-            delta_rotation = _rotation_6d_to_matrix(
-                self.delta_rotations_6d[pose_index:pose_index + 1].to(device=device)
-            )[0]
+            # Quaternion-delta paradigm: effective = normalize(delta_q) ⊗ base_q
+            delta_q = F.normalize(self.delta_rotations_quat[pose_index].to(device=device), dim=-1)
+            base_q  = self.base_lidar_to_camera_quat[0].to(device=device)
+            effective_q = _quaternion_multiply(delta_q, base_q)
+            delta_rotation = _quaternion_to_matrix(effective_q)   # (3,3) effective l2c rotation
             base_extrinsic_rotation = self.base_lidar_to_camera_rotation[0].to(device=device)
             base_extrinsic_translation = self.base_lidar_to_camera_translation[0].to(device=device)
             lidar_world_rotation = self.lidar_world_rotations[frame_index].to(device=device)
             lidar_world_translation = self.lidar_world_translations[frame_index].to(device=device)
 
-            extrinsic_rotation = delta_rotation @ base_extrinsic_rotation
+            extrinsic_rotation = delta_rotation
             if use_gt_translation:
                 extrinsic_translation = self.gt_lidar_to_camera_translation[0].to(device=device)
             else:
-                extrinsic_translation = (
-                    delta_rotation @ base_extrinsic_translation.unsqueeze(-1)
-                ).squeeze(-1) + delta_translation
+                # Decoupled parametrisation: T_eff = T_base + t_delta
+                # This avoids the moving-target problem where R_delta @ T_base changes
+                # as rotation converges, making t_delta chase a non-stationary gradient.
+                # t_delta converges to (T_gt - T_base), a constant independent of R.
+                extrinsic_translation = base_extrinsic_translation + delta_translation
 
             camera_to_lidar_rotation = extrinsic_rotation.transpose(0, 1)
             camera_to_lidar_translation = -(camera_to_lidar_rotation @ extrinsic_translation)
@@ -308,9 +363,9 @@ class CameraPoseCorrection(nn.Module):
         base_rotation = self.base_rotations[frame_index].to(device=device)
         base_translation = self.base_translations[frame_index].to(device=device)
         delta_translation = self.delta_translations[pose_index].to(device=device)
-        delta_rotation = _rotation_6d_to_matrix(
-            self.delta_rotations_6d[pose_index:pose_index + 1].to(device=device)
-        )[0]
+        # Quaternion-delta: effective = normalize(delta_q) ⊗ identity_base ≡ delta_rotation
+        delta_q = F.normalize(self.delta_rotations_quat[pose_index].to(device=device), dim=-1)
+        delta_rotation = _quaternion_to_matrix(delta_q)   # (3,3)
 
         camera_center = -(base_rotation @ base_translation)
         corrected_center = camera_center + base_rotation @ delta_translation
@@ -327,13 +382,15 @@ class CameraPoseCorrection(nn.Module):
         if device is None:
             device = self.delta_translations.device
         delta_translation = self.delta_translations[pose_index].to(device=device)
-        delta_rotation = _rotation_6d_to_matrix(
-            self.delta_rotations_6d[pose_index:pose_index + 1].to(device=device)
-        )[0]
+        # Quaternion-delta: effective = normalize(delta_q) ⊗ base_q
+        delta_q = F.normalize(self.delta_rotations_quat[pose_index].to(device=device), dim=-1)
+        base_q  = self.base_lidar_to_camera_quat[0].to(device=device)
+        effective_q = _quaternion_multiply(delta_q, base_q)
+        delta_rotation = _quaternion_to_matrix(effective_q)
         base_extrinsic_rotation = self.base_lidar_to_camera_rotation[0].to(device=device)
         base_extrinsic_translation = self.base_lidar_to_camera_translation[0].to(device=device)
 
-        extrinsic_rotation = delta_rotation @ base_extrinsic_rotation
+        extrinsic_rotation = delta_rotation
         if bool(self.use_gt_translation):
             extrinsic_translation = self.gt_lidar_to_camera_translation[0].to(device=device)
         else:
@@ -351,16 +408,48 @@ class CameraPoseCorrection(nn.Module):
         dtype = self.delta_translations.dtype
         extrinsic_rotation = extrinsic_rotation.to(device=device, dtype=dtype)
         extrinsic_translation = extrinsic_translation.to(device=device, dtype=dtype)
-        base_rotation = self.base_lidar_to_camera_rotation[0].to(device=device, dtype=dtype)
-        base_translation = self.base_lidar_to_camera_translation[0].to(device=device, dtype=dtype)
-        delta_rotation = extrinsic_rotation @ base_rotation.transpose(0, 1)
+
+        # Compute new delta_q such that effective_q ⊗ base_q = extrinsic_rotation
+        # → delta_q = extrinsic_q ⊗ conj(base_q)
+        extrinsic_q = _matrix_to_quaternion(extrinsic_rotation).to(device=device, dtype=dtype)
+        base_q = self.base_lidar_to_camera_quat[0]
+        base_q_conj = torch.stack([base_q[0], -base_q[1], -base_q[2], -base_q[3]])
+        delta_q = _quaternion_multiply(extrinsic_q, base_q_conj)
+        if delta_q[0] < 0:
+            delta_q = -delta_q
+        self.delta_rotations_quat[pose_index].copy_(delta_q)
+
+        # Translation delta
+        effective_R = extrinsic_rotation
+        base_translation = self.base_lidar_to_camera_translation[0]
         delta_translation = extrinsic_translation - (
-            delta_rotation @ base_translation.unsqueeze(-1)
+            effective_R @ base_translation.unsqueeze(-1)
         ).squeeze(-1)
-        self.delta_rotations_6d[pose_index].copy_(
-            _matrix_to_rotation_6d(delta_rotation.unsqueeze(0))[0]
-        )
         self.delta_translations[pose_index].copy_(delta_translation)
+
+    @torch.no_grad()
+    def update_extrinsics(self):
+        """Fold delta into the base quaternion, then reset delta to identity.
+
+        This is the update_extrinsics() step from SensorTrajectories:
+          base_q  ← normalize(delta_q) ⊗ base_q
+          delta_q ← [1, 0, 0, 0]
+        Keeps delta small (≈ identity) throughout training for stable gradients.
+        Only meaningful in shared-extrinsic mode.
+        """
+        if not self.use_shared_lidar_extrinsic:
+            return
+        delta_q = F.normalize(self.delta_rotations_quat[0], dim=-1)
+        base_q  = self.base_lidar_to_camera_quat[0]
+        new_base_q = _quaternion_multiply(delta_q, base_q)
+        if new_base_q[0] < 0:
+            new_base_q = -new_base_q
+        self.base_lidar_to_camera_quat[0].copy_(new_base_q)
+        # Also keep the 3x3 matrix buffer in sync
+        self.base_lidar_to_camera_rotation[0].copy_(_quaternion_to_matrix(new_base_q))
+        # Reset delta to identity [1, 0, 0, 0]
+        self.delta_rotations_quat.data.fill_(0.0)
+        self.delta_rotations_quat.data[:, 0] = 1.0
 
     @torch.no_grad()
     def apply_relative_camera_transform(
@@ -418,22 +507,23 @@ class CameraPoseCorrection(nn.Module):
         if trans_weight > 0.0:
             loss = loss + float(trans_weight) * self.delta_translations[index].pow(2).sum()
         if rot_weight > 0.0:
-            identity_6d = _matrix_to_rotation_6d(
-                torch.eye(3, dtype=self.delta_rotations_6d.dtype, device=self.delta_rotations_6d.device).unsqueeze(0)
-            )[0]
-            loss = loss + float(rot_weight) * (self.delta_rotations_6d[index] - identity_6d).pow(2).sum()
+            # Penalise deviation of delta_q from identity [1, 0, 0, 0]
+            identity_q = torch.zeros_like(self.delta_rotations_quat[index])
+            identity_q[0] = 1.0
+            loss = loss + float(rot_weight) * (self.delta_rotations_quat[index] - identity_q).pow(2).sum()
         return loss
 
     def pose_magnitude(self, frame_id: int):
         index = self._pose_index(frame_id)
         translation_norm = self.delta_translations[index].norm()
-        rotation = _rotation_6d_to_matrix(self.delta_rotations_6d[index:index + 1])[0]
-        rotation_deg = _rotation_angle_deg(rotation)
+        delta_q = F.normalize(self.delta_rotations_quat[index], dim=-1)
+        rotation_deg = _rotation_angle_deg(_quaternion_to_matrix(delta_q))
         return translation_norm, rotation_deg
 
     def global_pose_statistics(self):
         translation_norms = self.delta_translations.norm(dim=-1)
-        rotations = _rotation_6d_to_matrix(self.delta_rotations_6d)
+        delta_qs = F.normalize(self.delta_rotations_quat, dim=-1)   # [N, 4]
+        rotations = _quaternion_to_matrix(delta_qs)                  # [N, 3, 3]
         traces = torch.clamp((rotations[:, 0, 0] + rotations[:, 1, 1] + rotations[:, 2, 2] - 1.0) * 0.5, min=-1.0, max=1.0)
         rotation_degs = torch.rad2deg(torch.acos(traces))
         return {
@@ -450,9 +540,13 @@ class CameraPoseCorrection(nn.Module):
             device = self.delta_translations.device
         use_gt_translation = bool(self.use_gt_translation)
 
-        current_delta_rotation = _rotation_6d_to_matrix(
-            self.delta_rotations_6d[pose_index:pose_index + 1].to(device=device)
-        )[0]
+        # Current delta rotation (quaternion-delta paradigm)
+        # NOTE: must use just delta_q → delta_R here, NOT the composed effective rotation.
+        # The formula `relative = delta_R.T @ (gt_R @ base_R.T)` gives
+        # angle = geodesic(effective_R, gt_R) via cyclic trace invariance.
+        # Using effective_R instead of delta_R would break that equivalence.
+        delta_q = F.normalize(self.delta_rotations_quat[pose_index].to(device=device), dim=-1)
+        current_delta_rotation = _quaternion_to_matrix(delta_q)   # just delta, not composed
         current_delta_translation = self.delta_translations[pose_index].to(device=device)
 
         if self.use_shared_lidar_extrinsic:
@@ -560,15 +654,15 @@ class CameraPoseCorrection(nn.Module):
         if self.pose_mode != "all":
             return self.extrinsic_error(self.frame_ids[0], device=device)
         if self.use_shared_lidar_extrinsic:
-            delta_rotation = _rotation_6d_to_matrix(self.delta_rotations_6d[0:1].to(device=device))[0]
+            delta_q = F.normalize(self.delta_rotations_quat[0].to(device=device), dim=-1)
+            base_q  = self.base_lidar_to_camera_quat[0].to(device=device)
+            pred_rotation = _quaternion_to_matrix(_quaternion_multiply(delta_q, base_q))
             delta_translation = self.delta_translations[0].to(device=device)
-            base_rotation = self.base_lidar_to_camera_rotation[0].to(device=device)
             base_translation = self.base_lidar_to_camera_translation[0].to(device=device)
             gt_rotation = self.gt_lidar_to_camera_rotation[0].to(device=device)
             gt_translation = self.gt_lidar_to_camera_translation[0].to(device=device)
 
-            pred_rotation = delta_rotation @ base_rotation
-            pred_translation = (delta_rotation @ base_translation.unsqueeze(-1)).squeeze(-1) + delta_translation
+            pred_translation = (pred_rotation @ base_translation.unsqueeze(-1)).squeeze(-1) + delta_translation
             relative_rotation = pred_rotation.transpose(0, 1) @ gt_rotation
             translation_error = gt_translation - pred_translation
             return {
@@ -581,7 +675,8 @@ class CameraPoseCorrection(nn.Module):
 
         init_rotation = self.pose_init_rotations[0].to(device=device)
         init_translation = self.pose_init_translations[0].to(device=device)
-        delta_rotation = _rotation_6d_to_matrix(self.delta_rotations_6d[0:1].to(device=device))[0]
+        delta_q = F.normalize(self.delta_rotations_quat[0].to(device=device), dim=-1)
+        delta_rotation = _quaternion_to_matrix(delta_q)
         delta_translation = self.delta_translations[0].to(device=device)
 
         total_rotation = init_rotation @ delta_rotation

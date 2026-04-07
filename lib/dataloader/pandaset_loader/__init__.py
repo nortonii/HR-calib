@@ -8,7 +8,10 @@ from typing import Dict
 
 import numpy as np
 import torch
-from pandaset import DataSet
+try:
+    from pandaset import DataSet
+except ImportError:
+    DataSet = None
 from scipy.spatial.transform import Rotation as SciRotation
 from scipy.spatial.transform import Slerp
 

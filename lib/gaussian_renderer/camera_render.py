@@ -7,9 +7,18 @@ import math
 
 import torch
 import torch.nn.functional as F
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from diff_surfel_rasterization import GaussianRasterizationSettings as SurfelRasterizationSettings
-from diff_surfel_rasterization import GaussianRasterizer as SurfelRasterizer
+
+try:
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+    from diff_surfel_rasterization import GaussianRasterizationSettings as SurfelRasterizationSettings
+    from diff_surfel_rasterization import GaussianRasterizer as SurfelRasterizer
+    _RASTERIZATION_AVAILABLE = True
+except ImportError:
+    _RASTERIZATION_AVAILABLE = False
+    GaussianRasterizationSettings = None
+    GaussianRasterizer = None
+    SurfelRasterizationSettings = None
+    SurfelRasterizer = None
 
 from lib.gaussian_renderer import raytracing
 from lib.scene.cameras import Camera
@@ -111,7 +120,6 @@ def render_camera_3dgs(camera, gaussian_assets, args, scaling_modifier=1.0,
         campos=campos,
         prefiltered=False,
         debug=False,
-        antialiasing=False,
     )
     rasterizer = GaussianRasterizer(raster_settings)
 
@@ -175,23 +183,24 @@ def render_camera_3dgs(camera, gaussian_assets, args, scaling_modifier=1.0,
     except Exception:
         pass
 
-    rendered_image, _radii, _invdepths = rasterizer(
+    # Standard diff_gaussian_rasterization expects a single shs tensor (N, K, 3)
+    # combining DC (zeroth-order) and higher-order SH coefficients.
+    shs_combined = torch.cat([dc, sh], dim=1)  # (N, K, 3)
+    raster_result = rasterizer(
         means3D=means3D,
         means2D=screenspace_points,
-        dc=dc,
-        shs=sh,
+        shs=shs_combined,
         colors_precomp=None,
         opacities=opacities,
         scales=scales,
         rotations=rotations,
         cov3D_precomp=None,
     )
-    if _invdepths.dim() == 3 and _invdepths.shape[0] == 1:
-        invdepth = _invdepths[0]
-    else:
-        invdepth = _invdepths.squeeze()
-    valid_depth = invdepth > 1.0e-8
-    depth = torch.where(valid_depth, invdepth.reciprocal(), torch.zeros_like(invdepth))
+    rendered_image, _radii = raster_result[0], raster_result[1]
+    # Depth is not available from standard 3DGS rasterizer; return zeros.
+    depth = torch.zeros(rendered_image.shape[1], rendered_image.shape[2],
+                        device=rendered_image.device)
+    invdepth = depth
     # rendered_image: (3, H, W) → (H, W, 3)
     return {
         "rgb": rendered_image.permute(1, 2, 0),

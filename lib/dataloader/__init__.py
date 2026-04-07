@@ -2,7 +2,7 @@ import os
 
 import numpy
 import torch
-from lib.dataloader import kitti_loader, waymo_loader
+from lib.dataloader import kitti_loader
 from lib.dataloader import pandaset_loader
 from lib.dataloader import kitti_calib_loader
 from lib.dataloader.gs_loader import SceneLidar
@@ -11,6 +11,7 @@ from lib.utils.console_utils import *
 
 def load_scene(data_dir, args, test=False):
     if "waymo" in data_dir:
+        from lib.dataloader import waymo_loader
         print(blue("\n====== [Loading] Waymo Open Dataset ======"))
         lidars, bboxes = waymo_loader.load_waymo_raw(data_dir, args)
     elif "kitti-calibration" in data_dir or "kitti_calib" in data_dir:

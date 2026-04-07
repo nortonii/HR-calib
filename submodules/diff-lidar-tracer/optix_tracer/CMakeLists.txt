@@ -36,6 +36,9 @@ add_library(optix_tracer_backward OBJECT backward.cu)
 # Set the property for PTX compilation
 set_property(TARGET optix_tracer_forward PROPERTY CUDA_PTX_COMPILATION ON)
 set_property(TARGET optix_tracer_backward PROPERTY CUDA_PTX_COMPILATION ON)
+# PTX can only target a single architecture; override any multi-arch flags from parent
+set_property(TARGET optix_tracer_forward PROPERTY CUDA_ARCHITECTURES "90")
+set_property(TARGET optix_tracer_backward PROPERTY CUDA_ARCHITECTURES "90")
 # Get the path to the *.cu file
 get_filename_component(FORWARD_CU_PATH "${CMAKE_CURRENT_SOURCE_DIR}/forward.cu" ABSOLUTE)
 get_filename_component(BACKWARD_CU_PATH "${CMAKE_CURRENT_SOURCE_DIR}/backward.cu" ABSOLUTE)

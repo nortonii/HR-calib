@@ -1,0 +1,1 @@
+tensorboard --logdir /home/xzy/HR-calib/output/noise_inject_calib/test20_reproj/tb
