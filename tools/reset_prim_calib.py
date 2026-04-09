@@ -46,7 +46,7 @@ from lib import dataloader
 from lib.arguments import parse
 from lib.dataloader.kitti_calib_loader import load_kitti_calib_cameras
 from lib.gaussian_renderer import raytracing
-from lib.gaussian_renderer.camera_render import render_camera
+from lib.gaussian_renderer.camera_render import render_camera, render_camera_raytracing
 from lib.scene.camera_pose_correction import CameraPoseCorrection
 from lib.scene.cameras import Camera
 from lib.utils.console_utils import blue, green, red, yellow
@@ -321,6 +321,87 @@ def run_reset_prim_calib(
 # ─────────────────────────────────────────────────────────────
 
 
+def _build_cam_depth_refs(scene, pose_correction, cam_cameras: dict) -> dict:
+    """Pre-compute LiDAR-projected reference depth images at GT T_l2c.
+
+    Returns a dict {frame_id: Tensor(H, W)} stored on CPU.
+    Depths are Euclidean ray-lengths (metres), 0 = no observation.
+    The reference is FIXED — it does not depend on the Gaussian state or the
+    current pose estimate, so it is immune to the large-scale Gaussian problem.
+    Gradient flows only through d_lidar(T_l2c) during training.
+    """
+    gt_R = pose_correction.gt_lidar_to_camera_rotation[0].float()
+    gt_T = pose_correction.gt_lidar_to_camera_translation[0].float()
+
+    refs: dict = {}
+    for frame, cam in cam_cameras.items():
+        W_int = int(cam.image_width)
+        H_int = int(cam.image_height)
+        fx = W_int / (2.0 * math.tan(cam.FoVx * 0.5))
+        fy = H_int / (2.0 * math.tan(cam.FoVy * 0.5))
+        cx, cy = W_int / 2.0, H_int / 2.0
+
+        # ── LiDAR static points in world frame ──────────────────
+        try:
+            gt_mask_f  = scene.train_lidar.get_mask(frame).cuda()
+            dyn_mask_f = scene.train_lidar.get_dynamic_mask(frame).cuda()
+        except Exception:
+            gt_mask_f  = torch.ones(
+                scene.train_lidar.get_depth(frame).shape, dtype=torch.bool, device="cuda")
+            dyn_mask_f = torch.zeros_like(gt_mask_f)
+        valid_flat = (gt_mask_f & ~dyn_mask_f).reshape(-1)
+
+        rays_o_f, rays_d_f = scene.train_lidar.get_range_rays(frame)
+        gt_depth_f = scene.train_lidar.get_depth(frame).cuda()
+        P_world_f  = (rays_o_f + rays_d_f * gt_depth_f.unsqueeze(-1)).reshape(-1, 3)
+        P_valid    = P_world_f[valid_flat].detach()
+
+        if P_valid.shape[0] < 10:
+            refs[frame] = torch.zeros(H_int, W_int)
+            continue
+
+        # ── World → LiDAR sensor local frame ────────────────────
+        s2w = scene.train_lidar.sensor2world[frame].float().cuda()
+        P_local = (P_valid - s2w[:3, 3]) @ s2w[:3, :3]
+
+        # ── LiDAR local → camera (GT extrinsic) ─────────────────
+        R_dev = gt_R.to(P_local.device)
+        T_dev = gt_T.to(P_local.device)
+        P_cam = P_local @ R_dev.T + T_dev
+
+        # Keep only points in front of camera
+        front = P_cam[:, 2] > 0.1
+        P_f   = P_cam[front]
+        # Euclidean ray-depth (matches OptiX convention)
+        d_f   = P_f.norm(dim=-1)
+
+        u_f = fx * P_f[:, 0] / P_f[:, 2] + cx
+        v_f = fy * P_f[:, 1] / P_f[:, 2] + cy
+
+        in_fov = ((u_f >= 0) & (u_f < W_int) &
+                  (v_f >= 0) & (v_f < H_int))
+        u_i = u_f[in_fov].long().clamp(0, W_int - 1)
+        v_i = v_f[in_fov].long().clamp(0, H_int - 1)
+        d_i = d_f[in_fov]
+
+        if d_i.numel() == 0:
+            refs[frame] = torch.zeros(H_int, W_int)
+            continue
+
+        # ── Scatter-min: for each pixel keep the nearest depth ───
+        # Sort descending so nearest points overwrite farther ones
+        order     = d_i.argsort(descending=True)
+        idx_flat  = (v_i[order] * W_int + u_i[order])
+        d_sorted  = d_i[order]
+        D_flat    = torch.zeros(H_int * W_int, device=P_valid.device)
+        D_flat.scatter_(0, idx_flat, d_sorted)
+
+        refs[frame] = D_flat.reshape(H_int, W_int).cpu()
+        print(blue(f"[CamDepthRef] frame={frame}: {d_i.numel()} pts → "
+                   f"nonzero_px={int((D_flat > 0).sum())} / {H_int*W_int}"))
+
+    return refs
+
 
 def run_noise_inject_calib(
     gaussians,
@@ -350,6 +431,7 @@ def run_noise_inject_calib(
     lambda_reproj: float = 0.0,
     lambda_cross_view: float = 0.0,
     lambda_virtual_frame: float = 0.0,
+    lambda_cam_depth: float = 0.0,
     reset_gaussians_stage2: bool = False,
     no_freeze_stage2: bool = False,
     initial_gaussian_state: dict = None,
@@ -497,6 +579,7 @@ def run_noise_inject_calib(
     loss_reproj_accum = 0.0
     loss_cross_accum  = 0.0
     loss_virt_accum   = 0.0
+    loss_cam_d_accum  = 0.0
     # Best-T tracking: save the delta_T that achieved the lowest T_err
     best_T_err     = float("inf")
     best_delta_T   = pose_correction.delta_translations.data.clone()
@@ -507,10 +590,16 @@ def run_noise_inject_calib(
         print(blue(f"[NoiseInject] Resuming from cycle checkpoint: {resume_cycle_ckpt}"))
         ckpt = torch.load(resume_cycle_ckpt, weights_only=False, map_location="cuda")
         restore_gaussian_state(gaussians, ckpt["gaussian_state"], args)
-        pose_correction.delta_rotations_quat.data.copy_(
-            ckpt["delta_rotations_quat"].to("cuda"))
-        pose_correction.delta_translations.data.copy_(
-            ckpt["delta_translations"].to("cuda"))
+        if "pose_correction_state" in ckpt:
+            # New-format checkpoint: full state including accumulated base_q
+            pose_correction.load_state_dict(
+                {k: v.to("cuda") for k, v in ckpt["pose_correction_state"].items()})
+        else:
+            # Legacy checkpoint: only delta_q and delta_T saved
+            pose_correction.delta_rotations_quat.data.copy_(
+                ckpt["delta_rotations_quat"].to("cuda"))
+            pose_correction.delta_translations.data.copy_(
+                ckpt["delta_translations"].to("cuda"))
         pose_correction.update_extrinsics()
         global_iter   = ckpt["global_iter"]
         best_T_err    = ckpt["best_T_err"]
@@ -521,6 +610,15 @@ def run_noise_inject_calib(
                    f"stage2_active={stage2_active}, best_T_err={best_T_err:.4f}m"))
         # restore_gaussian_state resets requires_grad — re-apply freezes
         _apply_gaussian_freezes()
+
+    # ── Pre-compute GT-projected reference depth images ──────────────────────
+    # Used by lambda_cam_depth loss instead of Gaussian-rendered depths.
+    # Fixed at GT T_l2c — immune to Gaussian scale / quality issues.
+    cam_depth_refs: dict = {}
+    if lambda_cam_depth > 0.0 and cam_cameras:
+        print(blue("[NoiseInject] Pre-computing camera-view reference depth images..."))
+        cam_depth_refs = _build_cam_depth_refs(scene, pose_correction, cam_cameras)
+        print(blue(f"[NoiseInject] Built {len(cam_depth_refs)} reference depth images."))
 
     for cycle in range(start_cycle, total_cycles + 1):
         # ── Stage transition: enable translation at translation_start_cycle ──
@@ -716,6 +814,84 @@ def run_noise_inject_calib(
                                 loss_reproj = lambda_reproj * l1_loss(
                                     sp, sg.detach()
                                 )
+
+            # ── Camera-view depth loss (reference-based) ─────────────────
+            # Project LiDAR points into camera frame via differentiable T_l2c,
+            # compare their Euclidean depths with a PRE-COMPUTED REFERENCE depth
+            # image built by projecting the same LiDAR scan at GT T_l2c.
+            # This avoids Gaussian-rendered depth entirely (which is corrupted
+            # by huge-scale Gaussians from LiDAR training).
+            # Gradient flows: loss → d_lidar(T_l2c) and (u,v)(T_l2c) → T_l2c.
+            loss_cam_depth = torch.tensor(0.0, device="cuda")
+            if (lambda_cam_depth > 0.0
+                    and frame in cam_depth_refs
+                    and (not two_stage or stage2_active)):
+                d_ref_cpu = cam_depth_refs[frame]      # (H, W) on CPU
+
+                pidx_cd  = pose_correction._pose_index(frame)
+                dT_cd    = pose_correction.delta_translations[pidx_cd]
+                bT_cd    = pose_correction.base_lidar_to_camera_translation[0].cuda()
+                T_l2c_cd = bT_cd + dT_cd               # (3,) grad
+                dq_cd    = F.normalize(
+                    pose_correction.delta_rotations_quat[pidx_cd], dim=0)
+                bq_cd    = pose_correction.base_lidar_to_camera_quat[0].cuda()
+                R_l2c_cd = quaternion_to_matrix(quaternion_multiply(dq_cd, bq_cd))
+
+                # LiDAR static hit-points in world frame → sensor local frame
+                gt_mask_cd  = scene.train_lidar.get_mask(frame).cuda()
+                dyn_mask_cd = scene.train_lidar.get_dynamic_mask(frame).cuda()
+                valid_cd    = (gt_mask_cd & ~dyn_mask_cd).reshape(-1)
+                rays_o_cd, rays_d_cd = scene.train_lidar.get_range_rays(frame)
+                gt_depth_cd = scene.train_lidar.get_depth(frame).cuda()
+                P_world_cd  = (
+                    rays_o_cd + rays_d_cd * gt_depth_cd.unsqueeze(-1)
+                ).reshape(-1, 3).detach()
+                P_valid_cd  = P_world_cd[valid_cd]
+
+                s2w_cd     = scene.train_lidar.sensor2world[frame].cuda()
+                P_local_cd = (P_valid_cd - s2w_cd[:3, 3]) @ s2w_cd[:3, :3]
+
+                # LiDAR local → camera frame (grad w.r.t. T_l2c, R_l2c)
+                P_cam_cd  = P_local_cd @ R_l2c_cd.T + T_l2c_cd  # (N, 3)
+                front_cd  = P_cam_cd[:, 2] > 0.1
+                if front_cd.sum().item() > 50:
+                    P_f_cd     = P_cam_cd[front_cd]
+                    d_lidar_cd = P_f_cd.norm(dim=-1)             # Euclidean depth
+
+                    W_cd  = float(cam_cameras[frame].image_width)
+                    H_cd  = float(cam_cameras[frame].image_height)
+                    fx_cd = W_cd / (2.0 * math.tan(cam_cameras[frame].FoVx * 0.5))
+                    fy_cd = H_cd / (2.0 * math.tan(cam_cameras[frame].FoVy * 0.5))
+                    u_cd  = fx_cd * P_f_cd[:, 0] / P_f_cd[:, 2].clamp(min=0.1) + W_cd / 2.0
+                    v_cd  = fy_cd * P_f_cd[:, 1] / P_f_cd[:, 2].clamp(min=0.1) + H_cd / 2.0
+                    in_fov_cd = ((u_cd >= 0) & (u_cd < W_cd) &
+                                 (v_cd >= 0) & (v_cd < H_cd))
+
+                    if in_fov_cd.sum().item() > 50:
+                        u_ib_cd    = u_cd[in_fov_cd]
+                        v_ib_cd    = v_cd[in_fov_cd]
+                        d_lidar_ib = d_lidar_cd[in_fov_cd]
+
+                        # Sample reference depth at projected pixel locations.
+                        # Reference is FIXED (built from GT T_l2c) — detached.
+                        d_ref_gpu  = d_ref_cpu.to("cuda")          # (H, W)
+                        u_n_cd = (u_ib_cd / (W_cd - 1)) * 2.0 - 1.0
+                        v_n_cd = (v_ib_cd / (H_cd - 1)) * 2.0 - 1.0
+                        grid_cd = torch.stack(
+                            [u_n_cd, v_n_cd], dim=-1)[None, None]  # (1,1,K,2)
+                        d_ref_sampled = F.grid_sample(
+                            d_ref_gpu[None, None],                 # (1,1,H,W)
+                            grid_cd, mode='bilinear',
+                            align_corners=True, padding_mode='zeros',
+                        ).squeeze()                                 # (K,)
+
+                        # Supervise only where the GT projection has observations
+                        hit_cd = d_ref_sampled > 0.1
+                        if hit_cd.sum().item() > 10:
+                            loss_cam_depth = lambda_cam_depth * l1_loss(
+                                d_lidar_ib[hit_cd],
+                                d_ref_sampled[hit_cd].detach(),
+                            )
 
             # ── A: Pure geometric cross-view consistency ──────────────────
             # GT_i(π_i(T,P)) vs GT_j(π_j(T,P)) — no Gaussian rendering.
@@ -921,7 +1097,7 @@ def run_noise_inject_calib(
                         loss_virtual = lambda_virtual_frame * torch.stack(vf_losses).mean()
 
 
-            total_loss = loss_depth + loss_rgb + loss_reproj + loss_cross_view + loss_virtual
+            total_loss = loss_depth + loss_rgb + loss_reproj + loss_cross_view + loss_virtual + loss_cam_depth
             total_loss.backward()
             loss_accum        += total_loss.item()
             loss_depth_accum  += loss_depth.item()
@@ -929,6 +1105,7 @@ def run_noise_inject_calib(
             loss_reproj_accum += loss_reproj.item()
             loss_cross_accum  += loss_cross_view.item()
             loss_virt_accum   += loss_virtual.item()
+            loss_cam_d_accum  += loss_cam_depth.item()
 
             gaussians.optimizer.step()
             gaussians.optimizer.zero_grad(set_to_none=True)
@@ -949,6 +1126,7 @@ def run_noise_inject_calib(
         avg_reproj     = loss_reproj_accum / iters_per_cycle
         avg_cross      = loss_cross_accum  / iters_per_cycle
         avg_virt       = loss_virt_accum   / iters_per_cycle
+        avg_cam_d      = loss_cam_d_accum  / iters_per_cycle
         psnr_accum = 0.0
         psnr_count = 0
         loss_accum        = 0.0
@@ -957,6 +1135,7 @@ def run_noise_inject_calib(
         loss_reproj_accum = 0.0
         loss_cross_accum  = 0.0
         loss_virt_accum   = 0.0
+        loss_cam_d_accum  = 0.0
 
         # Track best translation seen so far
         if T_err < best_T_err:
@@ -965,11 +1144,12 @@ def run_noise_inject_calib(
 
         # Build optional loss-breakdown suffix
         breakdown = ""
-        if lambda_reproj > 0 or lambda_cross_view > 0 or lambda_virtual_frame > 0:
+        if lambda_reproj > 0 or lambda_cross_view > 0 or lambda_virtual_frame > 0 or lambda_cam_depth > 0:
             parts = [f"d={avg_depth:.4f}", f"rgb={avg_rgb:.4f}"]
             if lambda_reproj > 0:        parts.append(f"rp={avg_reproj:.4f}")
             if lambda_cross_view > 0:    parts.append(f"cv={avg_cross:.4f}")
             if lambda_virtual_frame > 0: parts.append(f"vf={avg_virt:.4f}")
+            if lambda_cam_depth > 0:     parts.append(f"cd={avg_cam_d:.4f}")
             breakdown = "  [" + "  ".join(parts) + "]"
 
         # ── ReduceLROnPlateau step ────────────────────────────
@@ -997,6 +1177,7 @@ def run_noise_inject_calib(
             tb_writer.add_scalar("noise_inject/loss_reproj",   avg_reproj,   cycle)
             tb_writer.add_scalar("noise_inject/loss_cross",    avg_cross,    cycle)
             tb_writer.add_scalar("noise_inject/loss_virt",     avg_virt,     cycle)
+            tb_writer.add_scalar("noise_inject/loss_cam_d",    avg_cam_d,    cycle)
 
         # ── Cycle checkpoint ──────────────────────────────────
         if (cycle_ckpt_dir is not None
@@ -1011,6 +1192,11 @@ def run_noise_inject_calib(
                 "stage2_active":        stage2_active,
                 "delta_rotations_quat": pose_correction.delta_rotations_quat.data.cpu(),
                 "delta_translations":   pose_correction.delta_translations.data.cpu(),
+                # Full pose_correction state (includes base_lidar_to_camera_quat which
+                # accumulates the rotation via update_extrinsics(); delta_q alone is
+                # always identity after each fold and cannot reconstruct the rotation).
+                "pose_correction_state": {k: v.cpu() for k, v in
+                                          pose_correction.state_dict().items()},
                 "gaussian_state":       save_gaussian_state(gaussians),
             }
             ckpt_path = os.path.join(cycle_ckpt_dir, f"cycle_{cycle:04d}.pth")
@@ -1141,6 +1327,14 @@ def main():
                              "with 3DGS, supervise rendered colors with GT from a real frame "
                              "warped via LiDAR geometry.  Combines Gaussian color gradient "
                              "(render) with geometric T gradient (real-frame projection).")
+    parser.add_argument("--lambda_cam_depth",     type=float, default=0.0,
+                        help="Weight of camera-view depth loss: project LiDAR points into "
+                             "camera frame via differentiable T_l2c, compare their Euclidean "
+                             "ray-depths with depths rendered by OptiX from the same camera "
+                             "viewpoint.  Gradient flows through the projection Jacobian "
+                             "∂d/∂T_l2c, providing a direct metric depth signal for translation. "
+                             "Rendered depth is detached so Gaussians cannot absorb T gradient. "
+                             "Only active in stage 2.  Requires camera data and raytracing backend.")
     parser.add_argument("--num_virtual_frames",    type=int,   default=1,
                         help="Virtual frames to sample per iteration. Default: 1.")
     parser.add_argument("--vf_neighbor_dist",      type=int,   default=5,
@@ -1361,6 +1555,7 @@ def main():
             lambda_reproj=cli.lambda_reproj,
             lambda_cross_view=cli.lambda_cross_view,
             lambda_virtual_frame=cli.lambda_virtual_frame,
+            lambda_cam_depth=cli.lambda_cam_depth,
             reset_gaussians_stage2=cli.reset_gaussians_stage2,
             no_freeze_stage2=cli.no_freeze_stage2,
             initial_gaussian_state=base_state,
