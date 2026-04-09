@@ -192,7 +192,7 @@ OptiXStateWrapper::OptiXStateWrapper(const std::string& pkg_dir)
     // 3 warning Hints that OptiX might not behave exactly as requested by the user or may perform slower than expected. 
     // 4 print Status or progress messages.
     options.logCallbackLevel = 3;
-    options.validationMode = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL;
+    options.validationMode = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_OFF;
     // Associate a CUDA context (and therefore a specific GPU) with this device context
     CUcontext cuCtx = 0;  // zero means take the current context
     OPTIX_CHECK(optixDeviceContextCreate(cuCtx, &options, &optixState->context));

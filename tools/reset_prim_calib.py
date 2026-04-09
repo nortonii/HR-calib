@@ -1,65 +1,24 @@
 #!/usr/bin/env python3
-"""Reset-primitive calibration: every N iterations reset all Gaussian primitives
-to the base checkpoint state while keeping the pose optimizer running.
-
-Motivation
-----------
-In joint Gaussian + pose training the Gaussians adapt to compensate for a wrong
-extrinsic, erasing the calibration gradient signal.  By periodically resetting
-Gaussian parameters (and their Adam state) to a fixed base state we prevent
-this co-adaptation.  The pose correction accumulates updates across all cycles
-and can therefore converge toward GT even though individual cycle Gaussians see
-only a short window of updates.
+"""Calibration training loop for LiDAR-camera extrinsic calibration via 3DGS.
 
 Two modes
 ---------
-  ``reset``  (default) — full parameter restore at start of every cycle.
-  ``noise``  — no full reset; instead add small Gaussian noise to covariance
-               (scale, rotation) and colour (SH) every ``noise_every`` iters to
-               prevent Gaussians from locking onto the wrong extrinsic.
-
-Algorithm (reset mode)
----------
-  1. Load dataset, camera data and (optionally) a warm-started Gaussian checkpoint.
-  2. Save "base Gaussian state" — parameters + optimizer are restored to this at
-     the start of every cycle.
-  3. Create CameraPoseCorrection with a biased initial rotation.
-  4. Repeat for `total_cycles` cycles:
-       a. restore_gaussian_state(base_state)   ← Gaussian params + Adam reset
-       b. Run `iters_per_cycle` training steps:
-            - LiDAR depth loss  (Gaussian gradient)
-            - Camera RGB loss   (Gaussian gradient + pose gradient)
-            - gaussians.optimizer.step()
-            - pose_optimizer.step() + update_extrinsics()
-       c. Log rotation error, PSNR.
-  5. Save final pose.
-
-Algorithm (noise mode)
----------
-  Same as reset mode except step (a) is replaced with:
-       a. Every `noise_every` global iters: add N(0,σ) to _scaling, _rotation,
-          _features_dc, _features_rest (no full restore; Adam state preserved).
-  Rotation noise is applied in quaternion space and re-normalised.
-  Scale  noise is applied in log space.
+  ``reset`` — full Gaussian parameter restore at start of every cycle.
+  ``noise`` — continuous training (no reset); default mode.
 
 Usage
 -----
 python tools/reset_prim_calib.py \\
     -dc configs/kitti_calib/static/5_50_t_cam_single_opa_pose_higs_default.yaml \\
     -ec configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml \\
-    --checkpoint output/lidar_rt/kitti_center_3000/scene_kc_5_50_t/models/model_it_3000.pth \\
-    --init_rot_deg 15.0 \\
-    --total_cycles 100 --iters_per_cycle 100 \\
-    --rotation_lr 2e-3
-
-# Noise-injection mode:
-python tools/reset_prim_calib.py \\
-    ... \\
-    --mode noise \\
-    --noise_every 200 \\
-    --noise_scale_std 0.05 \\
-    --noise_rot_std 0.02 \\
-    --noise_color_std 0.05
+    --init_rot_deg 9.9239 --init_rot_axis 0.5774 0.5774 0.5774 \\
+    --init_trans_xyz 0.0718 0.1314 0.0960 \\
+    --total_cycles 1200 --iters_per_cycle 50 \\
+    --translation_start_cycle 600 \\
+    --no_freeze_stage2 \\
+    --rotation_lr 0.01 \\
+    --warmup_cycles 4 \\
+    --output_dir output/noise_inject_calib/my_exp
 """
 
 import argparse
@@ -361,45 +320,6 @@ def run_reset_prim_calib(
 # Noise-injection helpers
 # ─────────────────────────────────────────────────────────────
 
-def inject_gaussian_noise(
-    gaussians,
-    noise_scale_std: float = 0.05,
-    noise_rot_std: float = 0.02,
-    noise_color_std: float = 0.05,
-    noise_xyz_std: float = 0.0,
-):
-    """Add small i.i.d. Gaussian noise to Gaussian parameters.
-
-    * ``_xyz``           — world-space means; noise in metres (default off, use ~0.005).
-    * ``_scaling``       — log-space scales; noise added in log space then written back.
-    * ``_rotation``      — stored as 4D quaternion; noise added component-wise then
-                           re-normalised so it stays on the unit sphere.
-    * ``_features_dc``   — DC SH colour component; direct additive noise.
-    * ``_features_rest`` — Higher-order SH; direct additive noise.
-    """
-    with torch.no_grad():
-        if noise_xyz_std > 0.0:
-            p = getattr(gaussians, "_xyz", None)
-            if p is not None:
-                p.data.add_(torch.randn_like(p.data) * noise_xyz_std)
-
-        if noise_scale_std > 0.0:
-            p = getattr(gaussians, "_scaling", None)
-            if p is not None:
-                p.data.add_(torch.randn_like(p.data) * noise_scale_std)
-
-        if noise_rot_std > 0.0:
-            p = getattr(gaussians, "_rotation", None)
-            if p is not None:
-                p.data.add_(torch.randn_like(p.data) * noise_rot_std)
-                p.data.copy_(F.normalize(p.data, dim=-1))
-
-        if noise_color_std > 0.0:
-            for attr in ("_features_dc", "_features_rest",
-                         "_features_rgb_dc", "_features_rgb_rest"):
-                p = getattr(gaussians, attr, None)
-                if p is not None:
-                    p.data.add_(torch.randn_like(p.data) * noise_color_std)
 
 
 def run_noise_inject_calib(
@@ -415,14 +335,15 @@ def run_noise_inject_calib(
     iters_per_cycle: int = 200,
     rotation_lr: float = 2e-3,
     translation_lr: float = 0.0015,
-    noise_every: int = 200,
-    noise_xyz_std: float = 0.0,
-    noise_scale_std: float = 0.05,
-    noise_rot_std: float = 0.02,
-    noise_color_std: float = 0.05,
-    noise_decay: float = 1.0,
     freeze_xyz: bool = False,
+    freeze_colors: bool = False,
+    freeze_covariance: bool = False,
     translation_start_cycle: int = 0,
+    warmup_cycles: int = 0,
+    freeze_rotation: bool = False,
+    lr_patience: int = 0,
+    lr_factor: float = 0.5,
+    lr_min: float = 1e-5,
     lambda_rgb: float = 1.0,
     lambda_depth: float = 1.0,
     lambda_dssim: float = 0.2,
@@ -430,38 +351,31 @@ def run_noise_inject_calib(
     lambda_cross_view: float = 0.0,
     lambda_virtual_frame: float = 0.0,
     reset_gaussians_stage2: bool = False,
+    no_freeze_stage2: bool = False,
     initial_gaussian_state: dict = None,
     dc_only: bool = False,
-    stage2_full_noise: bool = False,
     tb_writer=None,
+    cycle_ckpt_dir: str = None,
+    save_cycle_every: int = 5,
+    resume_cycle_ckpt: str = None,
+    num_virtual_frames: int = 1,
+    vf_neighbor_dist: int = 5,
+    vf_perturb_rot_deg: float = 5.0,
+    vf_perturb_trans_m: float = 0.3,
+    vf_min_overlap: int = 200,
 ):
-    """Continuous training loop with periodic noise injection into Gaussian params.
-
-    Unlike ``run_reset_prim_calib``, Gaussians are *never* fully restored to the
-    base checkpoint.  Instead, every ``noise_every`` global iterations small noise
-    is added to covariance (scale + rotation) and colour SH to prevent the
-    Gaussians from locking onto the current (potentially wrong) extrinsic.
-
-    ``noise_decay`` multiplies all noise stds after each injection event, so the
-    perturbation anneals over time (simulated-annealing style).  Default 1.0 = no
-    decay.  A value of e.g. 0.97 halves the noise after ~23 injections.
+    """Continuous calibration training loop.
 
     When ``pose_correction.use_gt_translation`` is False, ``delta_translations``
     is added to the optimizer so both rotation and translation are calibrated.
 
     When ``freeze_xyz`` is True, Gaussian mean positions are frozen (requires_grad
-    disabled, LR zeroed) so they cannot absorb translation errors.  xyz noise is
-    automatically disabled in this case.
+    disabled, LR zeroed) so they cannot absorb translation errors.
 
     ``translation_start_cycle`` implements a two-stage strategy:
-      Stage 1 (cycles 1..translation_start_cycle): rotation-only optimisation
-        (delta_translations frozen at initial value, xyz free to adapt).
-      Stage 2 (cycles translation_start_cycle+1..total): xyz is frozen to
-        eliminate the null space, and translation optimisation is enabled.
-        This is the recommended approach because (a) the rotation must be
-        close to GT before translation gradients become meaningful, and (b)
-        with frozen xyz the depth gradient goes exclusively to translation.
-    Default 0 = simultaneous (legacy behaviour, not recommended for 6DOF).
+      Stage 1 (cycles 1..translation_start_cycle): rotation-only optimisation.
+      Stage 2 (cycles translation_start_cycle+1..total): translation optimisation enabled.
+    Default 0 = simultaneous (legacy behaviour).
 
     The pose Adam state is kept across the whole run.
     """
@@ -492,30 +406,71 @@ def run_noise_inject_calib(
                 rp = getattr(gaussians, attr, None)
                 if rp is not None and any(p is rp for p in pg["params"]):
                     pg["lr"] = 0.0
-        noise_color_std = 0.0  # colour noise on frozen params is pointless
         print(blue("[NoiseInject] DC-ONLY mode: active_sh_degree=0, "
                    "features_rest frozen — no view-dependent colour compensation"))
 
-    # ── Optionally freeze Gaussian xyz (global, not two-stage) ─
-    if freeze_xyz and not two_stage:
-        xyz_param = getattr(gaussians, "_xyz", None)
-        if xyz_param is not None:
-            xyz_param.requires_grad_(False)
-        for pg in gaussians.optimizer.param_groups:
-            if any(p is xyz_param for p in pg["params"]):
-                pg["lr"] = 0.0
-        noise_xyz_std = 0.0
-        print(blue("[NoiseInject] Gaussian xyz FROZEN — translation has exclusive depth gradient"))
+    _COLOR_ATTRS = ["_features_dc", "_features_rgb_dc", "_features_rest", "_features_rgb_rest"]
 
-    # ── Pose optimizer: stage 1 = rotation only ───────────────
-    optimizer_param_groups = [
-        {"params": [pose_correction.delta_rotations_quat], "lr": rotation_lr}
-    ]
+    def _apply_gaussian_freezes():
+        """Freeze xyz and/or colors on the Gaussian + its Adam optimizer."""
+        if freeze_xyz and not two_stage:
+            xyz_param = getattr(gaussians, "_xyz", None)
+            if xyz_param is not None:
+                xyz_param.requires_grad_(False)
+            for pg in gaussians.optimizer.param_groups:
+                if any(p is xyz_param for p in pg["params"]):
+                    pg["lr"] = 0.0
+            print(blue("[NoiseInject] Gaussian xyz FROZEN — translation has exclusive depth gradient"))
+        if freeze_colors and not two_stage:
+            for attr in _COLOR_ATTRS:
+                param = getattr(gaussians, attr, None)
+                if param is not None:
+                    param.requires_grad_(False)
+            for pg in gaussians.optimizer.param_groups:
+                for attr in _COLOR_ATTRS:
+                    cp = getattr(gaussians, attr, None)
+                    if cp is not None and any(p is cp for p in pg["params"]):
+                        pg["lr"] = 0.0
+            print(blue("[NoiseInject] Gaussian colors FROZEN — SH cannot absorb translation gradient"))
+        _COV_ATTRS = ["_scaling", "_rotation"]
+        if freeze_covariance and not two_stage:
+            for attr in _COV_ATTRS:
+                param = getattr(gaussians, attr, None)
+                if param is not None:
+                    param.requires_grad_(False)
+            for pg in gaussians.optimizer.param_groups:
+                for attr in _COV_ATTRS:
+                    cp = getattr(gaussians, attr, None)
+                    if cp is not None and any(p is cp for p in pg["params"]):
+                        pg["lr"] = 0.0
+            print(blue("[NoiseInject] Gaussian covariance FROZEN (scale+rot)"))
+
+    _apply_gaussian_freezes()
+
+    # ── Pose optimizer: stage 1 ────────────────────────────────
+    optimizer_param_groups = []
+    if not freeze_rotation:
+        optimizer_param_groups.append(
+            {"params": [pose_correction.delta_rotations_quat], "lr": rotation_lr}
+        )
     if not pose_correction.use_gt_translation and not two_stage:
         optimizer_param_groups.append(
             {"params": [pose_correction.delta_translations], "lr": translation_lr}
         )
+    if not optimizer_param_groups:
+        raise ValueError("No parameters to optimize: both rotation and translation are frozen.")
     pose_optimizer = torch.optim.Adam(optimizer_param_groups)
+
+    # ── ReduceLROnPlateau for pose rotation ───────────────────
+    # Monitors rot_err: if no improvement for `lr_patience` cycles, halve the LR.
+    pose_lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        pose_optimizer,
+        mode="min",
+        factor=lr_factor,
+        patience=lr_patience,
+        min_lr=lr_min,
+        threshold=1e-3,
+    ) if lr_patience > 0 else None
 
     init_R   = _effective_R(pose_correction)
     init_err = _rotation_error_deg(init_R, gt_l2c_R)
@@ -525,29 +480,49 @@ def run_noise_inject_calib(
     print(blue(f"[NoiseInject] Init translation error vs GT: {init_T_err:.4f} m"))
     print(blue(f"[NoiseInject] total_iters={total_iters} ({total_cycles}×{iters_per_cycle}), "
                f"rotation_lr={rotation_lr}, translation_lr={translation_lr}, "
-               f"use_gt_translation={pose_correction.use_gt_translation}, "
-               f"noise_every={noise_every}, noise_decay={noise_decay}"))
-    print(blue(f"[NoiseInject] initial noise σ: xyz={noise_xyz_std}, scale={noise_scale_std}, rot={noise_rot_std}, color={noise_color_std}"))
+               f"use_gt_translation={pose_correction.use_gt_translation}"))
 
     if two_stage:
+        freeze_desc = "NO FREEZE (Gaussians continue training)" if no_freeze_stage2 else "freeze xyz+colors"
         print(blue(f"[NoiseInject] TWO-STAGE mode: rotation-only until cycle {translation_start_cycle}, "
-                   f"then freeze xyz + optimise translation"))
+                   f"then {freeze_desc} + optimise translation"))
 
     global_iter   = 0
-    inject_count  = 0          # number of noise injections so far
-    cur_xyz_std   = noise_xyz_std
-    cur_scale_std = noise_scale_std
-    cur_rot_std   = noise_rot_std
-    cur_color_std = noise_color_std
     frame_stack   = []
     psnr_accum    = 0.0
     psnr_count    = 0
-    loss_accum    = 0.0
+    loss_accum        = 0.0
+    loss_depth_accum  = 0.0
+    loss_rgb_accum    = 0.0
+    loss_reproj_accum = 0.0
+    loss_cross_accum  = 0.0
+    loss_virt_accum   = 0.0
     # Best-T tracking: save the delta_T that achieved the lowest T_err
     best_T_err     = float("inf")
     best_delta_T   = pose_correction.delta_translations.data.clone()
+    start_cycle    = 1
 
-    for cycle in range(1, total_cycles + 1):
+    # ── Resume from cycle checkpoint ──────────────────────────
+    if resume_cycle_ckpt is not None:
+        print(blue(f"[NoiseInject] Resuming from cycle checkpoint: {resume_cycle_ckpt}"))
+        ckpt = torch.load(resume_cycle_ckpt, weights_only=False, map_location="cuda")
+        restore_gaussian_state(gaussians, ckpt["gaussian_state"], args)
+        pose_correction.delta_rotations_quat.data.copy_(
+            ckpt["delta_rotations_quat"].to("cuda"))
+        pose_correction.delta_translations.data.copy_(
+            ckpt["delta_translations"].to("cuda"))
+        pose_correction.update_extrinsics()
+        global_iter   = ckpt["global_iter"]
+        best_T_err    = ckpt["best_T_err"]
+        best_delta_T  = ckpt["best_delta_T"].to("cuda")
+        stage2_active = ckpt["stage2_active"]
+        start_cycle   = ckpt["cycle"] + 1
+        print(blue(f"[NoiseInject] Resumed: start_cycle={start_cycle}, "
+                   f"stage2_active={stage2_active}, best_T_err={best_T_err:.4f}m"))
+        # restore_gaussian_state resets requires_grad — re-apply freezes
+        _apply_gaussian_freezes()
+
+    for cycle in range(start_cycle, total_cycles + 1):
         # ── Stage transition: enable translation at translation_start_cycle ──
         if two_stage and not stage2_active and cycle > translation_start_cycle:
             stage2_active = True
@@ -565,71 +540,51 @@ def run_noise_inject_calib(
                         p.requires_grad_(False)
                 for pg in gaussians.optimizer.param_groups:
                     pg["lr"] = 0.0
-                cur_xyz_std = cur_scale_std = cur_rot_std = cur_color_std = 0.0
                 print(blue(f"[NoiseInject] Stage 2 activated at cycle {cycle}: "
                            f"Gaussians RESET to original + ALL params FROZEN, "
                            f"translation optimizer added"))
             else:
                 # ── Option B: Freeze xyz + colors only (original behaviour) ──
                 # Freeze Gaussian xyz so they cannot absorb translation errors
-                xyz_param = getattr(gaussians, "_xyz", None)
-                if xyz_param is not None:
-                    xyz_param.requires_grad_(False)
-                for pg in gaussians.optimizer.param_groups:
-                    if any(p is xyz_param for p in pg["params"]):
-                        pg["lr"] = 0.0
-                cur_xyz_std = 0.0  # also disable xyz noise
-                # Freeze view-dependent SH colour features: they can compensate for
-                # small camera shifts and kill the translation gradient signal.
-                _color_attrs = [
-                    "_features_rest", "_features_rgb_rest",
-                    "_features_dc", "_features_rgb_dc",
-                ]
-                for attr in _color_attrs:
-                    param = getattr(gaussians, attr, None)
-                    if param is not None:
-                        param.requires_grad_(False)
-                for pg in gaussians.optimizer.param_groups:
-                    for attr in _color_attrs:
-                        cparam = getattr(gaussians, attr, None)
-                        if cparam is not None and any(p is cparam for p in pg["params"]):
+                if not no_freeze_stage2:
+                    xyz_param = getattr(gaussians, "_xyz", None)
+                    if xyz_param is not None:
+                        xyz_param.requires_grad_(False)
+                    for pg in gaussians.optimizer.param_groups:
+                        if any(p is xyz_param for p in pg["params"]):
                             pg["lr"] = 0.0
-                cur_color_std = 0.0  # disable colour noise in stage 2
-                if stage2_full_noise:
-                    # Reset noise to initial levels and stop decaying — gives
-                    # Gaussian covariance constant perturbation throughout stage 2
-                    cur_scale_std = noise_scale_std
-                    cur_rot_std   = noise_rot_std
-                    noise_decay   = 1.0
-                    print(blue(f"[NoiseInject] Stage 2 activated at cycle {cycle}: "
-                               f"xyz+colors FROZEN, translation optimizer added, "
-                               f"FULL NOISE: scale={cur_scale_std}, rot={cur_rot_std}, decay=1.0"))
-                else:
-                    print(blue(f"[NoiseInject] Stage 2 activated at cycle {cycle}: "
-                               f"xyz+colors FROZEN, translation optimizer added"))
+                    # Freeze view-dependent SH colour features: they can compensate for
+                    # small camera shifts and kill the translation gradient signal.
+                    _color_attrs = [
+                        "_features_rest", "_features_rgb_rest",
+                        "_features_dc", "_features_rgb_dc",
+                    ]
+                    for attr in _color_attrs:
+                        param = getattr(gaussians, attr, None)
+                        if param is not None:
+                            param.requires_grad_(False)
+                    for pg in gaussians.optimizer.param_groups:
+                        for attr in _color_attrs:
+                            cparam = getattr(gaussians, attr, None)
+                            if cparam is not None and any(p is cparam for p in pg["params"]):
+                                pg["lr"] = 0.0
+                freeze_msg = "xyz+colors FROZEN" if not no_freeze_stage2 else "NO FREEZE (Gaussians continue training)"
+                print(blue(f"[NoiseInject] Stage 2 activated at cycle {cycle}: "
+                           f"{freeze_msg}, translation optimizer added"))
             # Add translation to pose optimizer (fresh Adam state)
             pose_optimizer.add_param_group(
                 {"params": [pose_correction.delta_translations], "lr": translation_lr}
             )
+            # Reset scheduler so patience restarts fresh for stage 2
+            if pose_lr_scheduler is not None:
+                pose_lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    pose_optimizer, mode="min", factor=lr_factor,
+                    patience=lr_patience, min_lr=lr_min, threshold=1e-3,
+                )
 
         for it in range(1, iters_per_cycle + 1):
             global_iter += 1
-            gaussians.update_learning_rate(it)
-
-            # ── Periodic noise injection with optional decay ───
-            if global_iter % noise_every == 0:
-                inject_gaussian_noise(
-                    gaussians,
-                    noise_xyz_std=cur_xyz_std,
-                    noise_scale_std=cur_scale_std,
-                    noise_rot_std=cur_rot_std,
-                    noise_color_std=cur_color_std,
-                )
-                inject_count += 1
-                cur_xyz_std   *= noise_decay
-                cur_scale_std *= noise_decay
-                cur_rot_std   *= noise_decay
-                cur_color_std *= noise_decay
+            gaussians.update_learning_rate(global_iter)
 
             if not frame_stack:
                 frame_stack = list(frame_ids_train)
@@ -829,133 +784,158 @@ def run_noise_inject_calib(
                         loss_cross_view = lambda_cross_view * l1_loss(c_i_cv, c_j_cv)
 
             # ── B: Virtual-frame loss ─────────────────────────────────────
-            # Render an interpolated virtual camera, supervise rendered colors
-            # with GT from real frame warped via LiDAR geometry.  Combines
-            # Gaussian color gradient (render) with geometric T gradient
-            # (real-frame projection has ∂(u,v)/∂T).
+            # Interpolate sensor pose between frame i and a random neighbor j
+            # (within ±vf_neighbor_dist frames), then add a small random
+            # perturbation for diversity.  Interpolated poses have guaranteed
+            # overlap; perturbation adds viewpoint variety without risking
+            # camera flip.  Gradient flows via real-frame projection ∂(u,v)/∂T.
             loss_virtual = torch.tensor(0.0, device="cuda")
             if lambda_virtual_frame > 0.0 and (not two_stage or stage2_active):
-                frame_ids_list_v = list(frame_ids_train)
-                j_cands_v = [fid for fid in frame_ids_list_v
-                             if 1 <= abs(fid - frame) <= 2 and fid in cam_cameras]
+                if frame in cam_cameras:
+                    frame_ids_list_v = list(frame_ids_train)
+                    j_cands_v = [fid for fid in frame_ids_list_v
+                                 if 1 <= abs(fid - frame) <= vf_neighbor_dist
+                                 and fid in cam_cameras]
                 if j_cands_v and frame in cam_cameras:
-                    j_v = random.choice(j_cands_v)
-                    t_v = random.uniform(0.3, 0.7)
-
-                    S_i  = scene.train_lidar.sensor2world[frame].cuda().float()
-                    S_j  = scene.train_lidar.sensor2world[j_v].cuda().float()
-                    T_virt_s = (1-t_v)*S_i[:3, 3] + t_v*S_j[:3, 3]
-                    q_is = matrix_to_quaternion(S_i[:3, :3])
-                    q_js = matrix_to_quaternion(S_j[:3, :3])
-                    dot_v = (q_is * q_js).sum().clamp(-1, 1)
-                    if dot_v < 0:
-                        q_js, dot_v = -q_js, -dot_v
-                    if dot_v > 0.9995:
-                        q_virt = F.normalize((1-t_v)*q_is + t_v*q_js, dim=0)
-                    else:
-                        th_v   = dot_v.acos()
-                        q_virt = ((math.sin((1-t_v)*th_v.item())*q_is
-                                   + math.sin(t_v*th_v.item())*q_js) / th_v.sin())
-                    R_virt_s = quaternion_to_matrix(q_virt)
-
+                    # ── Real-frame LiDAR projection (T with grad) ──────────
                     pidx_v   = pose_correction._pose_index(frame)
                     dT_v     = pose_correction.delta_translations[pidx_v]
                     bT_v     = pose_correction.base_lidar_to_camera_translation[0].cuda()
-                    T_l2c_v  = (bT_v + dT_v).detach()
+                    T_l2c_vs = bT_v + dT_v          # grad ← T
+                    T_l2c_v  = T_l2c_vs.detach()
                     dq_v     = F.normalize(
                         pose_correction.delta_rotations_quat[pidx_v], dim=0)
                     bq_v     = pose_correction.base_lidar_to_camera_quat[0].cuda()
                     R_l2c_v  = quaternion_to_matrix(
                         quaternion_multiply(dq_v, bq_v)).detach()
 
-                    R_c2w_v  = R_virt_s @ R_l2c_v.T
-                    T_c2w_v  = R_virt_s @ (-(R_l2c_v.T @ T_l2c_v)) + T_virt_s
-                    R_w2c_v  = R_c2w_v.T
-                    T_w2c_v  = -R_c2w_v.T @ T_c2w_v
+                    gt_mask_vf    = scene.train_lidar.get_mask(frame).cuda()
+                    dyn_mask_vf   = scene.train_lidar.get_dynamic_mask(frame).cuda()
+                    valid_vf_flat = (gt_mask_vf & ~dyn_mask_vf).reshape(-1)
+                    rays_o_vf, rays_d_vf = scene.train_lidar.get_range_rays(frame)
+                    gt_dep_vf  = scene.train_lidar.get_depth(frame).cuda()
+                    P_world_vf = (rays_o_vf + rays_d_vf * gt_dep_vf.unsqueeze(-1)
+                                  ).reshape(-1, 3).detach()
+                    P_valid_vf = P_world_vf[valid_vf_flat]
 
-                    cam_ref_v = cam_cameras[frame]
-                    virt_cam  = Camera(
-                        timestamp=0,
-                        R=R_w2c_v.detach().cpu().numpy(),
-                        T=T_w2c_v.detach().cpu().numpy(),
-                        w=cam_ref_v.image_width, h=cam_ref_v.image_height,
-                        FoVx=cam_ref_v.FoVx, FoVy=cam_ref_v.FoVy,
-                    ).cuda()
-                    render_v = render_camera(virt_cam, [gaussians], args, require_rgb=True)
+                    s2w_vf   = scene.train_lidar.sensor2world[frame].cuda()
+                    P_l_vf   = (P_valid_vf - s2w_vf[:3, 3]) @ s2w_vf[:3, :3]
+                    P_c_real = P_l_vf @ R_l2c_v.T + T_l2c_vs  # grad ← T
 
-                    if render_v["num_visible"] > 0:
-                        # Real-frame projection (T_est with grad) → GT target
-                        pidx_vs  = pose_correction._pose_index(frame)
-                        dT_vs    = pose_correction.delta_translations[pidx_vs]
-                        bT_vs    = pose_correction.base_lidar_to_camera_translation[0].cuda()
-                        T_l2c_vs = bT_vs + dT_vs
-                        dq_vs    = F.normalize(
-                            pose_correction.delta_rotations_quat[pidx_vs], dim=0)
-                        bq_vs    = pose_correction.base_lidar_to_camera_quat[0].cuda()
-                        R_l2c_vs = quaternion_to_matrix(quaternion_multiply(dq_vs, bq_vs))
+                    cam_r  = cam_cameras[frame]
+                    W_vf   = float(cam_r.image_width); H_vf = float(cam_r.image_height)
+                    fx_vf  = W_vf/(2.0*math.tan(cam_r.FoVx*0.5))
+                    fy_vf  = H_vf/(2.0*math.tan(cam_r.FoVy*0.5))
+                    vz_r   = P_c_real[:, 2] > 0.1
+                    u_real = fx_vf*P_c_real[:,0]/P_c_real[:,2].clamp(min=0.1)+W_vf/2
+                    v_real = fy_vf*P_c_real[:,1]/P_c_real[:,2].clamp(min=0.1)+H_vf/2
+                    fov_r  = vz_r&(u_real>=0)&(u_real<W_vf)&(v_real>=0)&(v_real<H_vf)
 
-                        gt_mask_vf   = scene.train_lidar.get_mask(frame).cuda()
-                        dyn_mask_vf  = scene.train_lidar.get_dynamic_mask(frame).cuda()
-                        valid_vf_flat = (gt_mask_vf & ~dyn_mask_vf).reshape(-1)
+                    gt_full = F.grid_sample(
+                        cam_images[frame].cuda().permute(2,0,1).unsqueeze(0),
+                        torch.stack([(u_real/(W_vf-1))*2-1,
+                                     (v_real/(H_vf-1))*2-1], -1)[None, None],
+                        mode='bilinear', align_corners=True, padding_mode='zeros',
+                    ).squeeze(0).squeeze(1).permute(1, 0)  # [N_pts, 3]
 
-                        rays_o_vf, rays_d_vf = scene.train_lidar.get_range_rays(frame)
-                        gt_dep_vf = scene.train_lidar.get_depth(frame).cuda()
-                        P_world_vf = (rays_o_vf + rays_d_vf * gt_dep_vf.unsqueeze(-1)
-                                      ).reshape(-1, 3).detach()
-                        P_valid_vf = P_world_vf[valid_vf_flat]
+                    vf_losses = []
+                    for _ in range(num_virtual_frames):
+                        j_v = random.choice(j_cands_v)
+                        t_v = random.uniform(0.1, 0.9)
 
-                        s2w_vf   = scene.train_lidar.sensor2world[frame].cuda()
-                        P_l_vf   = (P_valid_vf - s2w_vf[:3, 3]) @ s2w_vf[:3, :3]
-                        P_c_real = P_l_vf @ R_l2c_vs.T + T_l2c_vs  # grad ← T
+                        # SLERP rotation + LERP translation between S_i and S_j
+                        S_i  = scene.train_lidar.sensor2world[frame].cuda().float()
+                        S_j  = scene.train_lidar.sensor2world[j_v].cuda().float()
+                        T_virt_s = (1-t_v)*S_i[:3, 3] + t_v*S_j[:3, 3]
+                        q_is = matrix_to_quaternion(S_i[:3, :3])
+                        q_js = matrix_to_quaternion(S_j[:3, :3])
+                        dot_v = (q_is * q_js).sum().clamp(-1, 1)
+                        if dot_v < 0:
+                            q_js, dot_v = -q_js, -dot_v
+                        if dot_v > 0.9995:
+                            q_virt = F.normalize((1-t_v)*q_is + t_v*q_js, dim=0)
+                        else:
+                            th_v   = dot_v.acos()
+                            q_virt = ((math.sin((1-t_v)*th_v.item())*q_is
+                                       + math.sin(t_v*th_v.item())*q_js) / th_v.sin())
+                        R_virt_s = quaternion_to_matrix(q_virt)
 
-                        cam_r  = cam_cameras[frame]
-                        W_vf   = float(cam_r.image_width); H_vf = float(cam_r.image_height)
-                        fx_vf  = W_vf/(2.0*math.tan(cam_r.FoVx*0.5))
-                        fy_vf  = H_vf/(2.0*math.tan(cam_r.FoVy*0.5))
-                        vz_r   = P_c_real[:, 2] > 0.1
-                        u_real = fx_vf*P_c_real[:,0]/P_c_real[:,2].clamp(min=0.1)+W_vf/2
-                        v_real = fy_vf*P_c_real[:,1]/P_c_real[:,2].clamp(min=0.1)+H_vf/2
-                        fov_r  = vz_r&(u_real>=0)&(u_real<W_vf)&(v_real>=0)&(v_real<H_vf)
+                        # Small random perturbation on top of interpolated pose
+                        if vf_perturb_rot_deg > 0 or vf_perturb_trans_m > 0:
+                            p_axis  = F.normalize(torch.randn(3, device="cuda"), dim=0)
+                            p_angle = random.uniform(0, vf_perturb_rot_deg * math.pi / 180)
+                            K_p = torch.zeros(3, 3, device="cuda")
+                            K_p[0,1], K_p[1,0] = -p_axis[2],  p_axis[2]
+                            K_p[0,2], K_p[2,0] =  p_axis[1], -p_axis[1]
+                            K_p[1,2], K_p[2,1] = -p_axis[0],  p_axis[0]
+                            R_p = (torch.eye(3, device="cuda")
+                                   + math.sin(p_angle) * K_p
+                                   + (1 - math.cos(p_angle)) * (K_p @ K_p))
+                            t_p = (F.normalize(torch.randn(3, device="cuda"), dim=0)
+                                   * random.uniform(0, vf_perturb_trans_m))
+                            R_virt_s = R_p @ R_virt_s
+                            T_virt_s = R_p @ T_virt_s + t_p
 
-                        P_l_virt = (P_valid_vf - T_virt_s) @ R_virt_s
-                        P_c_virt = P_l_virt @ R_l2c_v.T + T_l2c_v
+                        # Build virtual camera world-to-cam transform
+                        R_c2w_v = R_virt_s @ R_l2c_v.T
+                        T_c2w_v = R_virt_s @ (-(R_l2c_v.T @ T_l2c_v)) + T_virt_s
+                        R_w2c_v = R_c2w_v.T
+                        T_w2c_v = -R_c2w_v.T @ T_c2w_v
+
+                        virt_cam = Camera(
+                            timestamp=0,
+                            R=R_w2c_v.detach().cpu(),
+                            T=T_w2c_v.detach().cpu(),
+                            w=cam_r.image_width, h=cam_r.image_height,
+                            FoVx=cam_r.FoVx, FoVy=cam_r.FoVy,
+                        ).cuda()
+                        render_v = render_camera(virt_cam, [gaussians], args, require_rgb=True)
+                        if render_v["num_visible"] == 0:
+                            continue
+
+                        # Project LiDAR points into virtual camera frame
+                        P_in_virt_s = (P_valid_vf - T_virt_s) @ R_virt_s
+                        P_c_virt    = P_in_virt_s @ R_l2c_v.T + T_l2c_v
                         vz_virt  = P_c_virt[:, 2] > 0.1
                         u_virt   = fx_vf*P_c_virt[:,0]/P_c_virt[:,2].clamp(min=0.1)+W_vf/2
                         v_virt   = fy_vf*P_c_virt[:,1]/P_c_virt[:,2].clamp(min=0.1)+H_vf/2
-                        fov_virt = vz_virt&(u_virt>=0)&(u_virt<W_vf)&(v_virt>=0)&(v_virt<H_vf)
+                        fov_virt = (vz_virt&(u_virt>=0)&(u_virt<W_vf)
+                                    &(v_virt>=0)&(v_virt<H_vf))
 
                         valid_vf2 = fov_r & fov_virt
-                        if valid_vf2.sum().item() > 50:
-                            u_vn  = (u_virt[valid_vf2]/(W_vf-1))*2.0-1.0
-                            v_vn  = (v_virt[valid_vf2]/(H_vf-1))*2.0-1.0
-                            pred_vf2 = F.grid_sample(
-                                render_v["rgb"].clamp(0,1).permute(2,0,1).unsqueeze(0),
-                                torch.stack([u_vn,v_vn],-1)[None,None],
-                                mode='bilinear', align_corners=True,
-                                padding_mode='zeros',
-                            ).squeeze(0).squeeze(1).permute(1,0)
+                        if valid_vf2.sum().item() < vf_min_overlap:
+                            continue
 
-                            u_rn = (u_real[valid_vf2]/(W_vf-1))*2.0-1.0
-                            v_rn = (v_real[valid_vf2]/(H_vf-1))*2.0-1.0
-                            gt_vf2 = F.grid_sample(
-                                cam_images[frame].cuda().permute(2,0,1).unsqueeze(0),
-                                torch.stack([u_rn,v_rn],-1)[None,None],
-                                mode='bilinear', align_corners=True,
-                                padding_mode='zeros',
-                            ).squeeze(0).squeeze(1).permute(1,0)
+                        u_vn = (u_virt[valid_vf2]/(W_vf-1))*2-1
+                        v_vn = (v_virt[valid_vf2]/(H_vf-1))*2-1
+                        pred_vf2 = F.grid_sample(
+                            render_v["rgb"].clamp(0,1).permute(2,0,1).unsqueeze(0),
+                            torch.stack([u_vn, v_vn], -1)[None, None],
+                            mode='bilinear', align_corners=True, padding_mode='zeros',
+                        ).squeeze(0).squeeze(1).permute(1, 0)
 
-                            loss_virtual = lambda_virtual_frame * l1_loss(
-                                pred_vf2, gt_vf2.detach())
+                        gt_vf2 = gt_full[valid_vf2]
+                        vf_losses.append(l1_loss(pred_vf2, gt_vf2.detach()))
+
+                    if vf_losses:
+                        loss_virtual = lambda_virtual_frame * torch.stack(vf_losses).mean()
+
 
             total_loss = loss_depth + loss_rgb + loss_reproj + loss_cross_view + loss_virtual
             total_loss.backward()
-            loss_accum += total_loss.item()
+            loss_accum        += total_loss.item()
+            loss_depth_accum  += loss_depth.item()
+            loss_rgb_accum    += loss_rgb.item()
+            loss_reproj_accum += loss_reproj.item()
+            loss_cross_accum  += loss_cross_view.item()
+            loss_virt_accum   += loss_virtual.item()
 
             gaussians.optimizer.step()
             gaussians.optimizer.zero_grad(set_to_none=True)
 
-            pose_optimizer.step()
-            pose_correction.update_extrinsics()
+            if cycle > warmup_cycles:
+                pose_optimizer.step()
+                pose_correction.update_extrinsics()
             pose_optimizer.zero_grad(set_to_none=True)
 
         # ── End-of-cycle logging ───────────────────────────────
@@ -963,21 +943,48 @@ def run_noise_inject_calib(
         rot_err  = _rotation_error_deg(eff_R, gt_l2c_R)
         T_err    = _translation_error_m(pose_correction, gt_l2c_T)
         avg_psnr = psnr_accum / psnr_count if psnr_count > 0 else 0.0
-        avg_loss = loss_accum / iters_per_cycle
+        avg_loss       = loss_accum        / iters_per_cycle
+        avg_depth      = loss_depth_accum  / iters_per_cycle
+        avg_rgb        = loss_rgb_accum    / iters_per_cycle
+        avg_reproj     = loss_reproj_accum / iters_per_cycle
+        avg_cross      = loss_cross_accum  / iters_per_cycle
+        avg_virt       = loss_virt_accum   / iters_per_cycle
         psnr_accum = 0.0
         psnr_count = 0
-        loss_accum = 0.0
+        loss_accum        = 0.0
+        loss_depth_accum  = 0.0
+        loss_rgb_accum    = 0.0
+        loss_reproj_accum = 0.0
+        loss_cross_accum  = 0.0
+        loss_virt_accum   = 0.0
 
         # Track best translation seen so far
         if T_err < best_T_err:
             best_T_err = T_err
             best_delta_T = pose_correction.delta_translations.data.clone()
 
+        # Build optional loss-breakdown suffix
+        breakdown = ""
+        if lambda_reproj > 0 or lambda_cross_view > 0 or lambda_virtual_frame > 0:
+            parts = [f"d={avg_depth:.4f}", f"rgb={avg_rgb:.4f}"]
+            if lambda_reproj > 0:        parts.append(f"rp={avg_reproj:.4f}")
+            if lambda_cross_view > 0:    parts.append(f"cv={avg_cross:.4f}")
+            if lambda_virtual_frame > 0: parts.append(f"vf={avg_virt:.4f}")
+            breakdown = "  [" + "  ".join(parts) + "]"
+
+        # ── ReduceLROnPlateau step ────────────────────────────
+        cur_rot_lr = pose_optimizer.param_groups[0]["lr"]
+        if pose_lr_scheduler is not None and cycle > warmup_cycles:
+            pose_lr_scheduler.step(rot_err)
+            new_rot_lr = pose_optimizer.param_groups[0]["lr"]
+            if new_rot_lr < cur_rot_lr:
+                print(blue(f"  [LR] rotation_lr reduced: {cur_rot_lr:.2e} → {new_rot_lr:.2e}"))
+            cur_rot_lr = new_rot_lr
+
         print(yellow(
             f"  Cycle {cycle:3d}/{total_cycles}  rot_err={rot_err:.4f}°  "
             f"T_err={T_err:.4f}m  "
-            f"PSNR={avg_psnr:.2f} dB  loss={avg_loss:.5f}  "
-            f"noise_σ={cur_rot_std:.4f}"
+            f"PSNR={avg_psnr:.2f} dB  loss={avg_loss:.5f}  lr={cur_rot_lr:.2e}{breakdown}"
         ))
 
         if tb_writer is not None:
@@ -985,7 +992,46 @@ def run_noise_inject_calib(
             tb_writer.add_scalar("noise_inject/trans_err_m",   T_err,        cycle)
             tb_writer.add_scalar("noise_inject/psnr_db",       avg_psnr,     cycle)
             tb_writer.add_scalar("noise_inject/loss",          avg_loss,     cycle)
-            tb_writer.add_scalar("noise_inject/noise_rot_std", cur_rot_std,  cycle)
+            tb_writer.add_scalar("noise_inject/loss_depth",    avg_depth,    cycle)
+            tb_writer.add_scalar("noise_inject/loss_rgb",      avg_rgb,      cycle)
+            tb_writer.add_scalar("noise_inject/loss_reproj",   avg_reproj,   cycle)
+            tb_writer.add_scalar("noise_inject/loss_cross",    avg_cross,    cycle)
+            tb_writer.add_scalar("noise_inject/loss_virt",     avg_virt,     cycle)
+
+        # ── Cycle checkpoint ──────────────────────────────────
+        if (cycle_ckpt_dir is not None
+                and save_cycle_every > 0
+                and cycle % save_cycle_every == 0):
+            os.makedirs(cycle_ckpt_dir, exist_ok=True)
+            ckpt_payload = {
+                "cycle":                cycle,
+                "global_iter":          global_iter,
+                "best_T_err":           best_T_err,
+                "best_delta_T":         best_delta_T.cpu(),
+                "stage2_active":        stage2_active,
+                "delta_rotations_quat": pose_correction.delta_rotations_quat.data.cpu(),
+                "delta_translations":   pose_correction.delta_translations.data.cpu(),
+                "gaussian_state":       save_gaussian_state(gaussians),
+            }
+            ckpt_path = os.path.join(cycle_ckpt_dir, f"cycle_{cycle:04d}.pth")
+            torch.save(ckpt_payload, ckpt_path)
+            # Permanently preserve the last stage-1 checkpoint so stage-2
+            # can always be re-run without repeating stage 1.
+            if two_stage and cycle == translation_start_cycle:
+                stage1_path = os.path.join(cycle_ckpt_dir, "stage1_final.pth")
+                torch.save(ckpt_payload, stage1_path)
+                print(blue(f"  [ckpt] stage-1 final checkpoint → {stage1_path}"))
+            # Keep only the 3 most recent rolling checkpoints to save disk space
+            existing = sorted(
+                f for f in os.listdir(cycle_ckpt_dir)
+                if f.startswith("cycle_") and f.endswith(".pth")
+            )
+            for old in existing[:-3]:
+                try:
+                    os.remove(os.path.join(cycle_ckpt_dir, old))
+                except OSError:
+                    pass
+            print(blue(f"  [ckpt] saved cycle checkpoint → {ckpt_path}"))
 
     # Restore best translation
     with torch.no_grad():
@@ -1011,10 +1057,20 @@ def main():
     parser.add_argument("-ec", "--exp_config",   required=True)
     parser.add_argument("--checkpoint",          default=None,
                         help="Gaussian checkpoint (.pth) to use as base state")
+    parser.add_argument("--downsample_ratio",    type=float, default=1.0,
+                        help="Randomly keep this fraction of Gaussians after loading "
+                             "checkpoint (e.g. 0.5 keeps 50%%). Default 1.0 = no downsampling. "
+                             "Ignored if --voxel_size is set.")
+    parser.add_argument("--voxel_size",          type=float, default=0.0,
+                        help="Voxel size (meters) for spatial downsampling after loading "
+                             "checkpoint. Keeps one Gaussian per voxel cell. 0.0 = disabled.")
     parser.add_argument("--init_rot_deg",        type=float, default=15.0,
                         help="Initial rotation error magnitude (degrees)")
     parser.add_argument("--init_rot_axis",       type=float, nargs=3, default=None,
                         help="Fixed rotation axis (x y z); random if omitted")
+    parser.add_argument("--init_trans_xyz",      type=float, nargs=3, default=None,
+                        help="Initial translation error (dx dy dz) in meters added to "
+                             "the estimated extrinsic at start. E.g. --init_trans_xyz 0.07 0.13 0.10")
     parser.add_argument("--total_cycles",        type=int, default=100)
     parser.add_argument("--iters_per_cycle",     type=int, default=100)
     parser.add_argument("--rotation_lr",         type=float, default=2e-3)
@@ -1025,33 +1081,37 @@ def main():
                         choices=["reset", "noise"],
                         help="'reset': full Gaussian restore each cycle. "
                              "'noise': continuous training with periodic noise injection (default).")
-    # ── Noise-injection options (--mode noise) ───────────────
-    parser.add_argument("--noise_every",         type=int,   default=200,
-                        help="Inject noise every N global iterations (noise mode only)")
-    parser.add_argument("--noise_scale_std",     type=float, default=0.05,
-                        help="Std-dev of noise added to log-scale (_scaling) parameters")
-    parser.add_argument("--noise_rot_std",       type=float, default=0.02,
-                        help="Std-dev of noise added to Gaussian rotation quaternion components")
-    parser.add_argument("--noise_color_std",     type=float, default=0.05,
-                        help="Std-dev of noise added to SH colour features")
-    parser.add_argument("--noise_xyz_std",       type=float, default=0.2,
-                        help="Std-dev of noise added to Gaussian mean positions (metres). "
-                             "Default 0.2m — needed to prevent xyz over-adaptation when "
-                             "translation is also optimised. Set 0 to disable.")
-    parser.add_argument("--noise_decay",         type=float, default=0.97,
-                        help="Multiplicative decay applied to all noise stds after each "
-                             "injection event (e.g. 0.97 halves noise after ~23 injections). "
-                             "Default 0.97.")
+    # ─────────────────────────────────────────────────────────
     parser.add_argument("--freeze_xyz",          action="store_true",
                         help="Freeze Gaussian mean positions (_xyz) during calibration. "
                              "Prevents xyz from absorbing translation errors, giving the "
                              "translation optimizer an uncontested depth gradient. "
                              "Recommended when optimising translation (use_gt_translation=False).")
+    parser.add_argument("--freeze_colors",       action="store_true",
+                        help="Freeze Gaussian SH color features during calibration. "
+                             "Prevents view-dependent colors from absorbing camera-shift gradients.")
+    parser.add_argument("--freeze_covariance",   action="store_true",
+                        help="Freeze Gaussian scale and rotation (covariance) during calibration.")
     parser.add_argument("--translation_start_cycle", type=int, default=0,
                         help="Two-stage calibration: optimise rotation-only for this many cycles, "
                              "then freeze xyz and add translation optimisation. "
                              "0 = simultaneous (default). Recommended: ~75 (half of total_cycles). "
                              "Ignored when use_gt_translation=True.")
+    parser.add_argument("--warmup_cycles",         type=int, default=0,
+                        help="Freeze pose optimizer for this many cycles at the start, "
+                             "letting Gaussians train first before pose updates begin. "
+                             "Useful when training from scratch. Default: 0 (no warmup).")
+    parser.add_argument("--freeze_rotation",       action="store_true",
+                        help="Freeze rotation, optimise translation only. "
+                             "Use with --init_rot_deg to fix a pre-calibrated rotation.")
+    parser.add_argument("--lr_patience",          type=int,   default=0,
+                        help="ReduceLROnPlateau patience (cycles). If rot_err doesn't improve "
+                             "for this many cycles, pose rotation_lr is multiplied by lr_factor. "
+                             "0 = disabled (default). Recommended: 50-100.")
+    parser.add_argument("--lr_factor",            type=float, default=0.5,
+                        help="Multiplicative factor for ReduceLROnPlateau. Default: 0.5.")
+    parser.add_argument("--lr_min",               type=float, default=1e-5,
+                        help="Minimum rotation_lr floor for ReduceLROnPlateau. Default: 1e-5.")
     parser.add_argument("--lambda_reproj",        type=float, default=0.0,
                         help="Weight of LiDAR→camera reprojection loss. Provides a direct "
                              "geometric gradient for translation via the projection Jacobian. "
@@ -1062,11 +1122,10 @@ def main():
                              "clean photometric signal for translation because the original "
                              "Gaussians were trained with the correct extrinsic, so a wrong T "
                              "produces a real image residual.  Requires --translation_start_cycle > 0.")
-    parser.add_argument("--stage2_full_noise",      action="store_true",
-                        help="At stage 2 activation, reset noise std back to initial values and "
-                             "set noise_decay=1.0 (constant full noise throughout stage 2). "
-                             "Prevents Gaussians from freezing into the wrong-T pose during "
-                             "translation optimisation.  Requires --translation_start_cycle > 0.")
+    parser.add_argument("--no_freeze_stage2",        action="store_true",
+                        help="At stage 2 activation, do NOT freeze xyz or color parameters. "
+                             "Gaussians continue training freely alongside translation. "
+                             "Only the translation optimizer is added.")
     parser.add_argument("--dc_only",                 action="store_true",
                         help="Force DC-only SH (active_sh_degree=0) and freeze higher-order "
                              "SH coefficients throughout calibration.  Prevents Gaussians from "
@@ -1082,6 +1141,16 @@ def main():
                              "with 3DGS, supervise rendered colors with GT from a real frame "
                              "warped via LiDAR geometry.  Combines Gaussian color gradient "
                              "(render) with geometric T gradient (real-frame projection).")
+    parser.add_argument("--num_virtual_frames",    type=int,   default=1,
+                        help="Virtual frames to sample per iteration. Default: 1.")
+    parser.add_argument("--vf_neighbor_dist",      type=int,   default=5,
+                        help="Max frame-index distance for interpolation partner. Default: 5.")
+    parser.add_argument("--vf_perturb_rot_deg",    type=float, default=5.0,
+                        help="Max rotation perturbation added on top of interpolated pose (°). Default: 5.")
+    parser.add_argument("--vf_perturb_trans_m",    type=float, default=0.3,
+                        help="Max translation perturbation added on top of interpolated pose (m). Default: 0.3.")
+    parser.add_argument("--vf_min_overlap",        type=int,   default=200,
+                        help="Min overlapping LiDAR points to accept a virtual frame. Default: 200.")
     parser.add_argument("--use_gt_translation",  action="store_true",
                         help="Lock translation to GT (skip translation optimisation). "
                              "Default: False — both rotation and translation are calibrated.")
@@ -1090,6 +1159,12 @@ def main():
     parser.add_argument("--resume_from",         default=None,
                         help="Path to best_rotation.npz from a previous run; "
                              "use its final_R as starting rotation (overrides --init_rot_deg)")
+    parser.add_argument("--resume_cycle_ckpt",   default=None,
+                        help="Path to a cycle_NNNN.pth checkpoint; fully resumes Gaussian + "
+                             "pose state from that cycle (overrides --resume_from)")
+    parser.add_argument("--save_cycle_every",    type=int, default=5,
+                        help="Save a cycle checkpoint every N cycles (default: 5). "
+                             "Only the 2 most recent are kept. Set 0 to disable.")
     parser.add_argument("--output_dir",          default=None)
     parser.add_argument("--gpu",                 type=int, default=None)
     cli = parser.parse_args()
@@ -1149,6 +1224,55 @@ def main():
         print(blue("[ResetPrim] No checkpoint — using initial point-cloud state."))
         gaussians.training_setup(args.opt)
 
+    # ── Optional Gaussian downsampling ───────────────────────
+    if cli.voxel_size > 0.0:
+        xyz = gaussians.get_local_xyz.detach()          # (N, 3)
+        origin = xyz.min(dim=0).values
+        ijk = ((xyz - origin) / cli.voxel_size).long()  # (N, 3)
+        # Encode voxel key as single int64 (scene fits in ~1000^3 grid safely)
+        grid_size = ijk.max(dim=0).values + 1
+        voxel_key = ijk[:, 0] * (grid_size[1] * grid_size[2]) + \
+                    ijk[:, 1] * grid_size[2] + ijk[:, 2]
+        # Sort by voxel key, then keep first occurrence per voxel
+        sorted_order = voxel_key.argsort(stable=True)
+        sorted_keys  = voxel_key[sorted_order]
+        first_mask   = torch.cat([
+            torch.tensor([True], device="cuda"),
+            sorted_keys[1:] != sorted_keys[:-1]
+        ])
+        keep_idx = sorted_order[first_mask]
+        keep_idx, _ = keep_idx.sort()
+        n_total = xyz.shape[0]
+        for attr in _GAUSSIAN_ATTRS:
+            p = getattr(gaussians, attr, None)
+            if p is not None:
+                setattr(gaussians, attr, torch.nn.Parameter(
+                    p.data[keep_idx].requires_grad_(True)))
+        n_after = gaussians.get_local_xyz.shape[0]
+        gaussians.max_radii2D        = torch.zeros(n_after, device="cuda")
+        gaussians.xyz_gradient_accum = torch.zeros((n_after, 1), device="cuda")
+        gaussians.denom              = torch.zeros((n_after, 1), device="cuda")
+        gaussians.training_setup(args.opt)
+        print(blue(f"[ResetPrim] Voxel-downsampled {n_total} → {n_after} Gaussians "
+                   f"(voxel_size={cli.voxel_size:.3f}m)."))
+    elif cli.downsample_ratio < 1.0:
+        n_total = gaussians.get_local_xyz.shape[0]
+        n_keep  = max(1, int(n_total * cli.downsample_ratio))
+        keep_idx = torch.randperm(n_total, device="cuda")[:n_keep]
+        keep_idx, _ = keep_idx.sort()
+        for attr in _GAUSSIAN_ATTRS:
+            p = getattr(gaussians, attr, None)
+            if p is not None:
+                setattr(gaussians, attr, torch.nn.Parameter(
+                    p.data[keep_idx].requires_grad_(True)))
+        n_after = gaussians.get_local_xyz.shape[0]
+        gaussians.max_radii2D        = torch.zeros(n_after, device="cuda")
+        gaussians.xyz_gradient_accum = torch.zeros((n_after, 1), device="cuda")
+        gaussians.denom              = torch.zeros((n_after, 1), device="cuda")
+        gaussians.training_setup(args.opt)
+        print(blue(f"[ResetPrim] Random-downsampled {n_total} → {n_after} Gaussians "
+                   f"(ratio={cli.downsample_ratio:.2f})."))
+
     # ── Save base state (restored at start of every cycle) ────
     base_state = save_gaussian_state(gaussians)
     print(blue(f"[ResetPrim] Base state saved: {gaussians.get_local_xyz.shape[0]} Gaussians."))
@@ -1198,6 +1322,18 @@ def main():
         pose_correction.delta_rotations_quat.data.fill_(0.0)
         pose_correction.delta_rotations_quat.data[:, 0] = 1.0
 
+    # ── Apply initial translation bias ───────────────────────
+    if cli.init_trans_xyz is not None:
+        delta_t = torch.tensor(cli.init_trans_xyz, dtype=torch.float32, device="cuda")
+        with torch.no_grad():
+            pose_correction.base_lidar_to_camera_translation.data[0].copy_(
+                gt_l2c_T + delta_t
+            )
+            pose_correction.delta_translations.data.zero_()
+        init_t_err = delta_t.norm().item()
+        print(blue(f"[ResetPrim] Init translation perturbation: {cli.init_trans_xyz}  "
+                   f"(err={init_t_err:.4f} m)"))
+
     # ── Run ───────────────────────────────────────────────────
     if cli.mode == "noise":
         final_R = run_noise_inject_calib(
@@ -1213,22 +1349,31 @@ def main():
             iters_per_cycle=cli.iters_per_cycle,
             rotation_lr=cli.rotation_lr,
             translation_lr=cli.translation_lr,
-            noise_every=cli.noise_every,
-            noise_xyz_std=cli.noise_xyz_std,
-            noise_scale_std=cli.noise_scale_std,
-            noise_rot_std=cli.noise_rot_std,
-            noise_color_std=cli.noise_color_std,
-            noise_decay=cli.noise_decay,
             freeze_xyz=cli.freeze_xyz,
+            freeze_colors=cli.freeze_colors,
+            freeze_covariance=cli.freeze_covariance,
             translation_start_cycle=cli.translation_start_cycle,
+            warmup_cycles=cli.warmup_cycles,
+            freeze_rotation=cli.freeze_rotation,
+            lr_patience=cli.lr_patience,
+            lr_factor=cli.lr_factor,
+            lr_min=cli.lr_min,
             lambda_reproj=cli.lambda_reproj,
             lambda_cross_view=cli.lambda_cross_view,
             lambda_virtual_frame=cli.lambda_virtual_frame,
             reset_gaussians_stage2=cli.reset_gaussians_stage2,
+            no_freeze_stage2=cli.no_freeze_stage2,
             initial_gaussian_state=base_state,
             dc_only=cli.dc_only,
-            stage2_full_noise=cli.stage2_full_noise,
             tb_writer=tb_writer,
+            cycle_ckpt_dir=os.path.join(out_dir, "cycle_ckpts"),
+            save_cycle_every=cli.save_cycle_every,
+            resume_cycle_ckpt=cli.resume_cycle_ckpt,
+            num_virtual_frames=cli.num_virtual_frames,
+            vf_neighbor_dist=cli.vf_neighbor_dist,
+            vf_perturb_rot_deg=cli.vf_perturb_rot_deg,
+            vf_perturb_trans_m=cli.vf_perturb_trans_m,
+            vf_min_overlap=cli.vf_min_overlap,
         )
     else:
         final_R = run_reset_prim_calib(

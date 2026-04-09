@@ -1,0 +1,13 @@
+parent_config: "configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml"
+
+exp_name: "kitti_center_10000_cam_single_opa_pose_higs_nodecay_higherlr"
+
+opt:
+  position_lr_init: 0.00048      # 3x (base: 0.00016)
+  position_lr_final: 0.00048     # no decay
+  position_lr_delay_mult: 1.0    # disable warmup delay
+  position_lr_max_steps: 999999  # effectively infinite
+  feature_lr: 0.0075             # 3x (base: 0.0025)
+  opacity_lr: 0.15               # 3x (base: 0.05)
+  scaling_lr: 0.015              # 3x (base: 0.005)
+  rotation_lr: 0.003             # 3x (base: 0.001)

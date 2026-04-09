@@ -1,1 +1,1 @@
-tensorboard --logdir /home/xzy/HR-calib/output/noise_inject_calib/test20_reproj/tb
+tensorboard --logdir /home/xzy/HR-calib/output/noise_inject_calib/test44_from36ckpt_trans_freezexyz_colors/tb
