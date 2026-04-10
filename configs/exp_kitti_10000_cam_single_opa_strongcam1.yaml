@@ -1,0 +1,13 @@
+parent_config: "configs/exp_kitti_10000_cam.yaml"
+
+exp_name: "kitti_center_10000_cam_single_opa_strongcam1"
+
+model:
+  use_pose_correction: False
+  inverse_distance_init_num: 10000
+
+camera_dual_opacity: False
+
+opt:
+  lambda_rgb: 1.0
+  densify_grad_source: camera

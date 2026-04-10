@@ -119,75 +119,94 @@ class SceneLidar(Scene):
                 print("No dynamic objects in the scene")
                 args.dynamic = False
 
-        # initialize bkgd points
-        all_points = []
-        all_intensity = []
-        all_normals = []
-        for frame in range(frame_range[0], frame_range[1] + 1):
-            lidar_pts, lidar_intensity = lidar.inverse_projection(frame)
+        # initialize bkgd points — with disk cache to skip repeated normal
+        # estimation and voxel downsampling (the dominant startup cost).
+        source_dir  = getattr(args, "source_dir", "data")
+        scene_id    = str(getattr(args, "scene_id", "scene"))
+        data_scene  = str(getattr(args, "kitti_calib_scene", scene_id))
+        voxel_size  = float(getattr(args.model, "voxel_size", 0.15))
+        use_voxel   = bool(getattr(args.opt, "use_voxel_init", True))
+        cache_key   = f"fr{frame_range[0]}_{frame_range[1]}_vs{voxel_size}_vx{int(use_voxel)}"
+        cache_path  = os.path.join(source_dir, data_scene, f".init_cache_{cache_key}.npz")
 
-            points_lidar = o3d.geometry.PointCloud()
-            points_lidar.points = o3d.utility.Vector3dVector(
-                lidar_pts.cpu().numpy().astype(np.float64)
-            )
-            points_lidar.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamKNN(knn=6)
-            )
-            normals = torch.from_numpy(np.asarray(points_lidar.normals)).float()
-            for gaussian_model in self.gaussians_assets[1:]:
-                bbox = gaussian_model.bounding_box
-                T = bbox.frame[frame][0].cpu()
-                R = build_rotation(bbox.frame[frame][1])[0].cpu()
-                points_in_local = (lidar_pts - T) @ R.inverse().T
-                normals_in_local = normals @ R.inverse().T
-                mask = (torch.abs(points_in_local) < bbox.size.cpu() / 2).all(dim=1)
-                gaussian_model.tmp_points_intensities_list.append(
-                    (
-                        points_in_local[mask],
-                        lidar_intensity[mask],
-                        normals_in_local[mask],
-                    )
-                )
-                lidar_pts, lidar_intensity = lidar_pts[~mask], lidar_intensity[~mask]
-                normals = normals[~mask]
-
-            all_points.append(lidar_pts)
-            all_intensity.append(lidar_intensity)
-            all_normals.append(normals)
-
-        all_points = torch.cat(all_points, dim=0)
-        all_intensity = torch.cat(all_intensity, dim=0)
-        all_normals = torch.cat(all_normals, dim=0)
-        hit_probs = torch.ones(all_points.shape[0])
-        drop_probs = torch.zeros(all_points.shape[0])
-        ip = torch.stack([all_intensity, hit_probs, drop_probs], dim=1)
-
-        if args.opt.use_voxel_init:
-            points_lidar = o3d.geometry.PointCloud()
-            points_lidar.points = o3d.utility.Vector3dVector(
-                all_points.cpu().numpy().astype(np.float64)
-            )
-            points_lidar.colors = o3d.utility.Vector3dVector(
-                ip.cpu().numpy().astype(np.float64)
-            )
-            points_lidar.normals = o3d.utility.Vector3dVector(
-                all_normals.cpu().numpy().astype(np.float64)
-            )
-            downsample_points_lidar = points_lidar.voxel_down_sample(
-                voxel_size=args.model.voxel_size
-            )
-            all_points = torch.tensor(
-                np.asarray(downsample_points_lidar.points)
-            ).float()
-            ip = torch.tensor(np.asarray(downsample_points_lidar.colors)).float()
-            normals = torch.tensor(np.asarray(downsample_points_lidar.normals)).float()
+        if os.path.exists(cache_path):
+            print(f"[Init] Loading cached point cloud from {cache_path}")
+            cached = np.load(cache_path)
+            all_points = torch.from_numpy(cached["all_points"]).float()
+            ip         = torch.from_numpy(cached["ip"]).float()
+            normals    = torch.from_numpy(cached["normals"]).float()
         else:
-            mask = torch.randperm(all_points.shape[0])[
-                : all_points.shape[0] // (frame_range[1] - frame_range[0]) * 5
-            ]
-            all_points = all_points[mask]
-            ip = ip[mask]
-            normals = all_normals[mask]
+            all_points = []
+            all_intensity = []
+            all_normals = []
+            for frame in range(frame_range[0], frame_range[1] + 1):
+                lidar_pts, lidar_intensity = lidar.inverse_projection(frame)
+
+                points_lidar = o3d.geometry.PointCloud()
+                points_lidar.points = o3d.utility.Vector3dVector(
+                    lidar_pts.cpu().numpy().astype(np.float64)
+                )
+                points_lidar.estimate_normals(
+                    search_param=o3d.geometry.KDTreeSearchParamKNN(knn=6)
+                )
+                normals = torch.from_numpy(np.asarray(points_lidar.normals)).float()
+                for gaussian_model in self.gaussians_assets[1:]:
+                    bbox = gaussian_model.bounding_box
+                    T = bbox.frame[frame][0].cpu()
+                    R = build_rotation(bbox.frame[frame][1])[0].cpu()
+                    points_in_local = (lidar_pts - T) @ R.inverse().T
+                    normals_in_local = normals @ R.inverse().T
+                    mask = (torch.abs(points_in_local) < bbox.size.cpu() / 2).all(dim=1)
+                    gaussian_model.tmp_points_intensities_list.append(
+                        (
+                            points_in_local[mask],
+                            lidar_intensity[mask],
+                            normals_in_local[mask],
+                        )
+                    )
+                    lidar_pts, lidar_intensity = lidar_pts[~mask], lidar_intensity[~mask]
+                    normals = normals[~mask]
+
+                all_points.append(lidar_pts)
+                all_intensity.append(lidar_intensity)
+                all_normals.append(normals)
+
+            all_points = torch.cat(all_points, dim=0)
+            all_intensity = torch.cat(all_intensity, dim=0)
+            all_normals = torch.cat(all_normals, dim=0)
+            hit_probs = torch.ones(all_points.shape[0])
+            drop_probs = torch.zeros(all_points.shape[0])
+            ip = torch.stack([all_intensity, hit_probs, drop_probs], dim=1)
+
+            if use_voxel:
+                points_lidar = o3d.geometry.PointCloud()
+                points_lidar.points = o3d.utility.Vector3dVector(
+                    all_points.cpu().numpy().astype(np.float64)
+                )
+                points_lidar.colors = o3d.utility.Vector3dVector(
+                    ip.cpu().numpy().astype(np.float64)
+                )
+                points_lidar.normals = o3d.utility.Vector3dVector(
+                    all_normals.cpu().numpy().astype(np.float64)
+                )
+                downsample_points_lidar = points_lidar.voxel_down_sample(
+                    voxel_size=voxel_size
+                )
+                all_points = torch.tensor(
+                    np.asarray(downsample_points_lidar.points)
+                ).float()
+                ip = torch.tensor(np.asarray(downsample_points_lidar.colors)).float()
+                normals = torch.tensor(np.asarray(downsample_points_lidar.normals)).float()
+            else:
+                normals = all_normals
+
+            np.savez_compressed(
+                cache_path,
+                all_points=all_points.numpy(),
+                ip=ip.numpy(),
+                normals=normals.numpy(),
+            )
+            print(f"[Init] Saved point cloud cache to {cache_path}")
 
         inverse_distance_init_num = int(getattr(args.model, "inverse_distance_init_num", 0))
         if inverse_distance_init_num > 0:

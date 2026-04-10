@@ -1,0 +1,72 @@
+parent_config: configs/base.yaml
+
+model_dir: "output"
+task_name: default
+exp_name: test
+
+testing_iterations: 1000
+saving_iterations: [15000, 20000, 25000, 30000]
+visual_interval: 1000
+
+model:
+  voxel_size: 0.15
+  bkgd_extent_factor : 3
+  object_extent_factor: 4
+  obj_pt_num: 10_000
+  dimension: 2
+  sh_degree: 3
+  camera_render_backend: rasterization
+  freeze_gaussian_centers: False
+
+opt:
+  iterations: 30_000
+  position_lr_max_steps: 30_000
+
+  densification_interval: 100
+  opacity_reset_interval: 3000
+  densify_from_iter: 500
+  densify_until_iter: 15_000
+  densify_until_num_points: -1
+
+  densify_use_absgrads: False
+  densify_scale_threshold: 0.0002
+  densify_grad_threshold: 0.0002
+  densify_weight_threshold: 0.0
+  prune_size_threshold: 0.1
+  thresh_opa_prune: 0.003
+
+  lambda_normal: 0.00
+  lambda_cd: 0.01
+  lambda_depth_l1: 0.1
+  lambda_intensity_l1: 0.85
+  lambda_intensity_l2: 0.0
+  lambda_intensity_dssim: 0.15
+  lambda_raydrop_bce: 0.01
+  lambda_reg: 0.01
+  lambda_rgb: 0.0
+  lambda_rgb_dssim: 0.2
+  lambda_rgb_phase: 0.0
+  camera_geometry_grad_scale: 1.0
+  prune_nonfinite_gaussians: False
+  enable_lidar_supervision: True
+  enable_densification: True
+  lidar_depth_use_image_visibility_weights: False
+  lidar_depth_visible_weight: 2.0
+  lidar_depth_occluded_weight: 0.5
+  lidar_depth_outside_weight: 1.0
+  lidar_depth_visibility_tolerance: 0.25
+  use_rayhit: True
+
+  use_normal_init: True
+  use_voxel_init: True
+
+
+refine:
+  use_refine: True
+  use_spatial: True
+  use_rot: False
+
+  epochs: 400
+  batch_size: 16
+  lr: 0.001
+  lambda_raydrop_bce: 0.01
