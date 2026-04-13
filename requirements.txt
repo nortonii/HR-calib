@@ -30,6 +30,7 @@ imageio
 imageio-ffmpeg
 pillow
 matplotlib
+vismatch
 
 # numerical
 scipy

@@ -4,7 +4,7 @@ exp_name: "kitti_center_10000_cam_single_opa_pose_higs_default_gtt_fastlr"
 
 opt:
   lambda_rgb_phase: 0.0
-  use_voxel_init: False
+  use_voxel_init: True
 
 model:
   use_pose_correction: True

@@ -3,18 +3,51 @@
 
 Continuous training (no reset); noise-injection mode only.
 
-Usage
+Supported datasets (set via data_type in the data config YAML):
+  - KITTICalib  (data/kitti-calibration)  requires: kitti_calib_scene
+  - KITTI       (data/kitti360)            requires: kitti_seq; optional: camera_scale
+  - Waymo       (data/waymo/...)           optional: waymo_camera_id (1=FRONT), camera_scale
+  - PandaSet    (data/pandaset)            optional: pandaset_camera_name, camera_scale
+
+Usage (KITTI-Calibration)
 -----
 python tools/calib.py \\
     -dc configs/kitti_calib/static/5_50_t_cam_single_opa_pose_higs_default.yaml \\
     -ec configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml \\
     --init_rot_deg 9.9239 --init_rot_axis 0.5774 0.5774 0.5774 \\
-    --init_trans_xyz 0.0718 0.1314 0.0960 \\
-    --total_cycles 300 --iters_per_cycle 200 \\
-    --translation_start_cycle 150 \\
-    --rotation_lr 0.002 \\
-    --warmup_cycles 1 \\
+    --total_cycles 300 --iters_per_cycle 150 \\
+    --rotation_lr 0.002 --warmup_cycles 1 \\
     --output_dir output/calib/my_exp
+
+Usage (KITTI-360)
+-----
+python tools/calib.py \\
+    -dc configs/kitti360/static/k3_cam.yaml \\
+    -ec configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml \\
+    --init_rot_deg 5.0 --init_rot_axis 0.5774 0.5774 0.5774 \\
+    --total_cycles 300 --iters_per_cycle 150 \\
+    --rotation_lr 0.002 --warmup_cycles 1 \\
+    --output_dir output/calib/kitti360_k3
+
+Usage (Waymo)
+-----
+python tools/calib.py \\
+    -dc configs/waymo/static/t0_cam.yaml \\
+    -ec configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml \\
+    --init_rot_deg 5.0 --init_rot_axis 0.5774 0.5774 0.5774 \\
+    --total_cycles 300 --iters_per_cycle 150 \\
+    --rotation_lr 0.002 --warmup_cycles 1 \\
+    --output_dir output/calib/waymo_t0
+
+Usage (PandaSet)
+-----
+python tools/calib.py \\
+    -dc configs/pandaset/static/1.yaml \\
+    -ec configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml \\
+    --init_rot_deg 5.0 --init_rot_axis 0.5774 0.5774 0.5774 \\
+    --total_cycles 300 --iters_per_cycle 150 \\
+    --rotation_lr 0.002 --warmup_cycles 1 \\
+    --output_dir output/calib/pandaset_1
 """
 
 import argparse
@@ -41,6 +74,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from lib import dataloader
 from lib.arguments import parse
 from lib.dataloader.kitti_calib_loader import load_kitti_calib_cameras
+from lib.dataloader.kitti_loader import load_kitti360_cameras
+from lib.dataloader.pandaset_loader import load_pandaset_cameras
+from lib.dataloader.waymo_loader import load_waymo_cameras
 from lib.gaussian_renderer import raytracing
 from lib.gaussian_renderer.camera_render import render_camera
 from lib.scene.camera_pose_correction import CameraPoseCorrection
@@ -208,6 +244,8 @@ def run_noise_inject_calib(
     cycle_ckpt_dir: str = None,
     save_cycle_every: int = 5,
     resume_cycle_ckpt: str = None,
+    reset_gaussians_every: int = 0,
+    disable_depth_after_cycle: int = 0,
 ):
     """Continuous calibration training loop.
 
@@ -267,18 +305,9 @@ def run_noise_inject_calib(
                     if cp is not None and any(p is cp for p in pg["params"]):
                         pg["lr"] = 0.0
             print(blue("[NoiseInject] Gaussian colors FROZEN — SH cannot absorb translation gradient"))
-        _COV_ATTRS = ["_scaling", "_rotation"]
+        _COV_ATTRS = ["_scaling", "_rotation", "_opacity", "_opacity_cam"]
         if freeze_covariance and not two_stage:
-            for attr in _COV_ATTRS:
-                param = getattr(gaussians, attr, None)
-                if param is not None:
-                    param.requires_grad_(False)
-            for pg in gaussians.optimizer.param_groups:
-                for attr in _COV_ATTRS:
-                    cp = getattr(gaussians, attr, None)
-                    if cp is not None and any(p is cp for p in pg["params"]):
-                        pg["lr"] = 0.0
-            print(blue("[NoiseInject] Gaussian covariance FROZEN (scale+rot)"))
+            print(blue("[NoiseInject] Gaussian cov+opacity: LiDAR-only gradients (RGB grads will be zeroed)"))
 
     _apply_gaussian_freezes()
 
@@ -315,12 +344,15 @@ def run_noise_inject_calib(
     print(blue(f"[NoiseInject] total_iters={total_iters} ({total_cycles}×{iters_per_cycle}), "
                f"rotation_lr={rotation_lr}, translation_lr={translation_lr}, "
                f"use_gt_translation={pose_correction.use_gt_translation}"))
+    if disable_depth_after_cycle > 0:
+        print(blue(f"[NoiseInject] Depth supervision disabled after cycle {disable_depth_after_cycle}"))
 
     if two_stage:
         print(blue(f"[NoiseInject] TWO-STAGE mode: rotation-only until cycle {translation_start_cycle}, "
                    f"then freeze xyz+colors + optimise translation"))
 
     global_iter   = 0
+    gaussian_iter = 0
     frame_stack   = []
     psnr_accum    = 0.0
     psnr_count    = 0
@@ -349,6 +381,7 @@ def run_noise_inject_calib(
                 ckpt["delta_translations"].to("cuda"))
         pose_correction.update_extrinsics()
         global_iter   = ckpt["global_iter"]
+        gaussian_iter = ckpt["global_iter"]
         best_T_err    = ckpt["best_T_err"]
         best_delta_T  = ckpt["best_delta_T"].to("cuda")
         stage2_active = ckpt["stage2_active"]
@@ -392,8 +425,9 @@ def run_noise_inject_calib(
 
         for it in range(1, iters_per_cycle + 1):
             global_iter += 1
+            gaussian_iter += 1
             if not freeze_gaussians:
-                gaussians.update_learning_rate(global_iter)
+                gaussians.update_learning_rate(gaussian_iter)
 
             if not frame_stack:
                 frame_stack = list(frame_ids_train)
@@ -405,7 +439,11 @@ def run_noise_inject_calib(
             # appear in the LiDAR raytracing path, so this render provides no
             # pose gradient and only wastes compute.
             loss_depth = torch.tensor(0.0, device="cuda")
-            if not freeze_gaussians:
+            depth_active = (
+                not freeze_gaussians
+                and (disable_depth_after_cycle <= 0 or cycle <= disable_depth_after_cycle)
+            )
+            if depth_active:
                 render_pkg = raytracing(
                     frame, [gaussians], scene.train_lidar, background, args, depth_only=True
                 )
@@ -440,7 +478,19 @@ def run_noise_inject_calib(
                     psnr_count += 1
 
             total_loss = loss_depth + loss_rgb
-            total_loss.backward()
+            if freeze_covariance and not freeze_gaussians:
+                # LiDAR-only covariance: RGB backward first, zero those grads, then depth
+                _COV_OPA = ["_scaling", "_rotation", "_opacity", "_opacity_cam"]
+                if loss_rgb.requires_grad:
+                    loss_rgb.backward()  # separate graph from depth render, no retain needed
+                    for attr in _COV_OPA:
+                        p = getattr(gaussians, attr, None)
+                        if p is not None and p.grad is not None:
+                            p.grad.zero_()
+                if loss_depth.requires_grad:
+                    loss_depth.backward()
+            else:
+                total_loss.backward()
             loss_accum       += total_loss.item()
             loss_depth_accum += loss_depth.item()
             loss_rgb_accum   += loss_rgb.item()
@@ -451,8 +501,24 @@ def run_noise_inject_calib(
 
             if cycle > warmup_cycles:
                 pose_optimizer.step()
-                pose_correction.update_extrinsics()
             pose_optimizer.zero_grad(set_to_none=True)
+
+        # ── Fold delta into base once per cycle ────────────────
+        if cycle > warmup_cycles:
+            pose_correction.update_extrinsics()
+
+        # ── Periodic Gaussian reset: keep pose, refresh scene ──
+        if (
+            reset_gaussians_every > 0
+            and initial_gaussian_state is not None
+            and cycle < total_cycles
+            and cycle % reset_gaussians_every == 0
+        ):
+            restore_gaussian_state(gaussians, initial_gaussian_state, args)
+            _apply_gaussian_freezes()
+            gaussian_iter = 0
+            frame_stack = []
+            print(blue(f"[NoiseInject] Gaussian state RESET to init at cycle {cycle} (pose kept)"))
 
         # ── End-of-cycle logging ───────────────────────────────
         eff_R    = _effective_R(pose_correction)
@@ -613,6 +679,12 @@ def main():
     parser.add_argument("--save_cycle_every",    type=int, default=5,
                         help="Save a cycle checkpoint every N cycles (default: 5). "
                              "Only the 3 most recent are kept. Set 0 to disable.")
+    parser.add_argument("--reset_gaussians_every", type=int, default=0,
+                        help="Reset Gaussians to their initial state every N cycles "
+                             "while keeping the current pose. 0 = disabled.")
+    parser.add_argument("--disable_depth_after_cycle", type=int, default=0,
+                        help="Disable LiDAR raytracing depth supervision after this cycle. "
+                             "0 = keep depth supervision for all cycles.")
     parser.add_argument("--output_dir",          default=None)
     parser.add_argument("--gpu",                 type=int, default=None)
     cli = parser.parse_args()
@@ -639,7 +711,8 @@ def main():
 
     # ── Camera data ───────────────────────────────────────────
     camera_scale = float(getattr(args, "camera_scale", 1))
-    if "kitticalib" in _dtype.replace("-", "").replace("_", ""):
+    _dtype_norm = _dtype.replace("-", "").replace("_", "")
+    if "kitticalib" in _dtype_norm:
         scene_name = getattr(args, "kitti_calib_scene", None)
         if scene_name is None:
             print(red("[Calib] kitti_calib_scene not set. Exiting."))
@@ -649,8 +722,29 @@ def main():
             args.source_dir, args, scene_name=scene_name,
             frame_ids=frame_ids, scale=camera_scale,
         )
+    elif "kitti" in _dtype_norm:
+        kitti_seq = getattr(args, "kitti_seq", None)
+        if kitti_seq is None:
+            print(red("[Calib] kitti_seq not set. Exiting."))
+            sys.exit(1)
+        frame_ids = list(range(args.frame_length[0], args.frame_length[1] + 1))
+        cam_cameras, cam_images = load_kitti360_cameras(
+            args.source_dir, args, seq_num=int(kitti_seq),
+            frame_ids=frame_ids, scale=camera_scale,
+        )
+    elif "waymo" in _dtype_norm:
+        camera_id = int(getattr(args, "waymo_camera_id", 1))
+        cam_cameras, cam_images = load_waymo_cameras(
+            args.source_dir, args, camera_id=camera_id, scale=camera_scale,
+        )
+    elif "pandaset" in _dtype_norm or "panda" in _dtype_norm:
+        camera_name = getattr(args, "pandaset_camera_name", "front_camera")
+        cam_cameras, cam_images = load_pandaset_cameras(
+            args.source_dir, args, camera_name=camera_name, scale=camera_scale,
+        )
     else:
-        print(red(f"[Calib] Dataset '{_dtype}' not supported."))
+        print(red(f"[Calib] Dataset type '{_dtype}' not supported. "
+                  f"Supported: KITTICalib, KITTI (KITTI-360), Waymo, PandaSet."))
         sys.exit(1)
     print(blue(f"[Calib] Loaded {len(cam_cameras)} camera frames."))
 
@@ -808,6 +902,8 @@ def main():
         cycle_ckpt_dir=os.path.join(out_dir, "cycle_ckpts"),
         save_cycle_every=cli.save_cycle_every,
         resume_cycle_ckpt=cli.resume_cycle_ckpt,
+        reset_gaussians_every=cli.reset_gaussians_every,
+        disable_depth_after_cycle=cli.disable_depth_after_cycle,
     )
 
     # ── Save result ───────────────────────────────────────────

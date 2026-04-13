@@ -1,0 +1,4 @@
+parent_config: "configs/pandaset/exp_300_base.yaml"
+
+exp_name: "pandaset_center_300_rowoffset"
+gpus: [1]

@@ -1,0 +1,12 @@
+parent_config: "configs/exp_kitti_3000.yaml"
+
+exp_name: "kitti_center_3000_lidar_only_2dgs"
+
+model:
+  camera_render_backend: surfel_rasterization
+  use_pose_correction: False
+
+opt:
+  lambda_rgb: 0.0
+  camera_geometry_grad_scale: 1.0
+  prune_nonfinite_gaussians: True

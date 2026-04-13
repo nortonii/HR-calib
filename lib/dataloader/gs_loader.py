@@ -128,6 +128,7 @@ class SceneLidar(Scene):
         use_voxel   = bool(getattr(args.opt, "use_voxel_init", True))
         cache_key   = f"fr{frame_range[0]}_{frame_range[1]}_vs{voxel_size}_vx{int(use_voxel)}"
         cache_path  = os.path.join(source_dir, data_scene, f".init_cache_{cache_key}.npz")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
 
         if os.path.exists(cache_path):
             print(f"[Init] Loading cached point cloud from {cache_path}")

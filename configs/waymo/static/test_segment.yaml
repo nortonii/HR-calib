@@ -1,0 +1,11 @@
+parent_config: "configs/waymo/waymo_base.yaml"
+source_dir: "data/waymo/two_frame"
+
+frame_length: [0, 1]
+eval_frames: [0]
+
+scene_id: waymo_test
+
+dynamic: False
+waymo_camera_id: 1
+camera_scale: 4

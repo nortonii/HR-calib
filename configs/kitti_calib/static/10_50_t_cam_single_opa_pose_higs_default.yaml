@@ -1,0 +1,3 @@
+parent_config: "configs/kitti_calib/static/10_50_t_cam_single_opa_pose_higs.yaml"
+
+scene_id: kc_10_50_t_cam_single_opa_pose_higs_default_gtt_fastlr

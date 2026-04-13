@@ -114,7 +114,7 @@ Both cross-modal `RGB ↔ rendered-depth` matching and intra-modal `RGB ↔ RGB`
 
 Recommended two-stage workflow:
 
-1. Train a LiDAR-only 2DGS scene in `HR-calib`:
+1. Train a LiDAR-only 2DGS scene:
 
 ```bash
 cd /home/xzy/HR-calib
@@ -123,22 +123,21 @@ python train.py \
   -ec configs/exp_kitti_3000_lidar_only_2dgs.yaml
 ```
 
-2. Export per-frame rendered camera-depth maps as raw `.npy`:
+2. Export per-frame rendered camera-depth maps as raw `.npy` cache from `hr-tiny`:
 
 ```bash
-cd /home/xzy/HR-calib
-python eval.py \
-  -dc configs/kitti_calib/static/5_50_t_cam_single_opa_pose_higs_default_hrtiny_data.yaml \
+cd /home/xzy/hr-tiny
+python tools/export_rendered_depth_cache.py \
+  -dc configs/kitti_calib/static/5_50_t_cam_single_opa_pose_higs_default_local_data.yaml \
   -ec configs/exp_kitti_3000_lidar_only_2dgs.yaml \
-  -t all \
-  --save_rendered_depth \
-  -s output/lidar_rt/kitti_center_3000_lidar_only_2dgs/scene_kc_5_50_t_cam_single_opa_pose_higs_default_gtt_fastlr/evals/rendered_depth_export
+  -m /home/xzy/HR-calib/output/lidar_rt/kitti_center_3000_lidar_only_2dgs/scene_kc_5_50_t_cam_single_opa_pose_higs_default_gtt_fastlr/models/model_it_3000.pth \
+  -o output/depth_cache_5_50_t
 ```
 
 The exported depth maps land in:
 
 ```text
-/home/xzy/HR-calib/output/lidar_rt/kitti_center_3000_lidar_only_2dgs/scene_kc_5_50_t_cam_single_opa_pose_higs_default_gtt_fastlr/evals/rendered_depth_export/all/rendered_depth
+/home/xzy/hr-tiny/output/depth_cache_5_50_t
 ```
 
 ```bash

@@ -1,0 +1,6 @@
+data_type: "PandaSet"
+source_dir: "data/pandaset"
+seq: "001"
+pandaset_lidar_sensor_id: 0
+lidar_origin_mode: "center"
+pandaset_camera_name: "front_camera"

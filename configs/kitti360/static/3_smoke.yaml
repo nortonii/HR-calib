@@ -1,0 +1,5 @@
+parent_config: "configs/kitti360/static/3.yaml"
+
+seq: "0003"
+frame_length: [99, 128]
+eval_frames: [105, 112, 119, 126]

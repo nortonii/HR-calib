@@ -1,0 +1,9 @@
+parent_config: "configs/kitti360/kitti_base.yaml"
+
+kitti_seq: 5
+frame_length: [2855, 2884]
+eval_frames: [2861, 2868, 2875, 2882]
+
+scene_id: kn5
+
+dynamic: False

@@ -1,0 +1,14 @@
+parent_config: "configs/pandaset/exp_300_center.yaml"
+
+exp_name: "pandaset_center_3000_densify"
+
+opt:
+  iterations: 3000
+  position_lr_max_steps: 3000
+  densify_from_iter: 500
+  densify_until_iter: 2000
+  densify_until_num_points: 5000000
+
+testing_iterations: 500
+saving_iterations: [500, 1000, 2000, 3000]
+visual_interval: 500

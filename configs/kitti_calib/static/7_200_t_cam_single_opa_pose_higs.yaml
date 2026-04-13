@@ -1,0 +1,9 @@
+parent_config: "configs/kitti_calib/kitti_calib_base.yaml"
+
+kitti_calib_scene: "7-200-t"
+frame_length: [0, 49]
+eval_frames: [5, 15, 25, 35, 45]
+
+scene_id: kc_7_200_t_cam_single_opa_pose_higs
+
+dynamic: False

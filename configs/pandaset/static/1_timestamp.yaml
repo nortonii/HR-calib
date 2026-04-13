@@ -1,0 +1,6 @@
+parent_config: "configs/pandaset/pandaset_base.yaml"
+frame_length: [0, 79]
+eval_frames: [10, 20, 30, 40, 50, 60, 70]
+scene_id: ps1_ts
+dynamic: False
+lidar_origin_mode: "timestamp_column"
