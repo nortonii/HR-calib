@@ -56,6 +56,49 @@ with open(f"{base}/calibs/{seq:02d}.txt","w") as f:
 Run with `python -u` and `tee` so progress is visible in the log file in real time.
 **`-u` is required** — without it, stdout is block-buffered when piped and the log stays empty.
 
+### KITTI-calib (best recipe)
+
+1800 cycles, Gaussian reset every 100 cycles, depth supervision disabled after cycle 10.
+This is the recommended recipe: ~2° final rotation error on scene 5-50-t.
+
+```bash
+EXP=output/calib/kc_5_50_t_1800_reset100_depth10
+mkdir -p $EXP
+
+python -u tools/calib.py \
+  -dc configs/kitti_calib/static/5_50_t_1800_reset100_depth10.yaml \
+  -ec configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml \
+  --init_rot_deg 9.9239 --init_rot_axis 0.5774 0.5774 0.5774 \
+  --use_gt_translation \
+  --total_cycles 1800 --iters_per_cycle 150 \
+  --rotation_lr 0.002 \
+  --warmup_cycles 1 \
+  --reset_gaussians_every 100 \
+  --disable_depth_after_cycle 10 \
+  --output_dir $EXP \
+  2>&1 | tee $EXP/train.log
+```
+
+To resume from a cycle checkpoint (e.g., to extend a finished run):
+
+```bash
+python -u tools/calib.py \
+  -dc configs/kitti_calib/static/5_50_t_1800_reset100_depth10.yaml \
+  -ec configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml \
+  --init_rot_deg 9.9239 --init_rot_axis 0.5774 0.5774 0.5774 \
+  --use_gt_translation \
+  --total_cycles 2400 --iters_per_cycle 150 \
+  --rotation_lr 0.002 \
+  --warmup_cycles 1 \
+  --reset_gaussians_every 100 \
+  --disable_depth_after_cycle 10 \
+  --resume_cycle_ckpt $EXP/cycle_1800.pth \
+  --output_dir $EXP \
+  2>&1 | tee -a $EXP/train.log
+```
+
+Quick baseline (300 cycles, no reset):
+
 ```bash
 EXP=output/calib/kc_5_50_t_gtT_biasR
 mkdir -p $EXP
@@ -65,8 +108,7 @@ python -u tools/calib.py \
   -ec configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml \
   --init_rot_deg 9.9239 --init_rot_axis 0.5774 0.5774 0.5774 \
   --use_gt_translation \
-  --translation_start_cycle 9999 \
-  --total_cycles 300 --iters_per_cycle 200 \
+  --total_cycles 300 --iters_per_cycle 150 \
   --rotation_lr 0.002 \
   --warmup_cycles 1 \
   --output_dir $EXP \
@@ -77,6 +119,51 @@ Monitor progress from another terminal:
 
 ```bash
 grep "Cycle" $EXP/train.log | tail -10
+```
+
+### Waymo Open Dataset
+
+Place a `.tfrecord` file (single file per directory) under `data/waymo/<segment_name>/`.
+The test config uses a 2-frame sample from the Waymo open-dataset repo:
+
+```bash
+# Download 2-frame test tfrecord (9.7 MB, no auth required)
+mkdir -p data/waymo/two_frame
+curl -L https://raw.githubusercontent.com/waymo-research/waymo-open-dataset/master/src/waymo_open_dataset/v2/perception/compat_v1/testdata/two_frame.tfrecord \
+     -o data/waymo/two_frame/two_frame.tfrecord
+```
+
+Run calibration:
+
+```bash
+EXP=output/calib/waymo_test
+mkdir -p $EXP
+
+python -u tools/calib.py \
+  -dc configs/waymo/static/test_segment.yaml \
+  -ec configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml \
+  --init_rot_deg 5.0 --init_rot_axis 0.5774 0.5774 0.5774 \
+  --use_gt_translation \
+  --total_cycles 300 --iters_per_cycle 150 \
+  --rotation_lr 0.002 \
+  --warmup_cycles 1 \
+  --reset_gaussians_every 100 \
+  --disable_depth_after_cycle 10 \
+  --output_dir $EXP \
+  2>&1 | tee $EXP/train.log
+```
+
+For real Waymo segments, create a scene config under `configs/waymo/static/<name>.yaml`:
+
+```yaml
+parent_config: "configs/waymo/waymo_base.yaml"
+source_dir: "data/waymo/<segment_dir>"
+frame_length: [0, 19]
+eval_frames: [0, 5, 10, 15]
+scene_id: waymo_<name>
+dynamic: False
+waymo_camera_id: 1   # 1=FRONT, 2=FRONT_LEFT, 3=FRONT_RIGHT, 4=SIDE_LEFT, 5=SIDE_RIGHT
+camera_scale: 4
 ```
 
 ### Init cache
