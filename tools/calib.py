@@ -93,6 +93,7 @@ from lib.utils.rgbd_calibration import (
     depth_to_match_image,
     initialize_shared_extrinsic,
     match_cross_modal,
+    match_cross_modal_dense,
     optimize_shared_extrinsic,
     sample_depth_values,
     select_match_points,
@@ -340,6 +341,9 @@ def _compute_matcher_color_loss(
     matcher_color_weight: float,
     temporal_support_points: np.ndarray | None = None,
     temporal_support_radius_px: float = 6.0,
+    dense_mode: bool = False,
+    dense_stride: int = 4,
+    dense_cert_threshold: float = 0.02,
 ) -> tuple[torch.Tensor, dict]:
     device = pred_rgb.device
     gt_rgb_np = _to_uint8_rgb(gt_rgb)
@@ -350,7 +354,14 @@ def _compute_matcher_color_loss(
         percentile_high=matcher_depth_percentile_high,
         use_inverse=matcher_depth_use_inverse,
     )
-    rgb_points, depth_points, _ = match_cross_modal(matcher, gt_rgb_np, depth_vis)
+    if dense_mode:
+        rgb_points, depth_points, _certs = match_cross_modal_dense(
+            matcher, gt_rgb_np, depth_vis,
+            query_stride=dense_stride,
+            cert_threshold=dense_cert_threshold,
+        )
+    else:
+        rgb_points, depth_points, _ = match_cross_modal(matcher, gt_rgb_np, depth_vis)
     raw_matches = int(rgb_points.shape[0])
     if temporal_support_points is not None:
         support_mask = _filter_points_by_support(
@@ -935,6 +946,7 @@ def run_noise_inject_calib(
     translation_start_cycle: int = 0,
     warmup_cycles: int = 0,
     freeze_rotation: bool = False,
+    freeze_translation: bool = False,
     lr_patience: int = 0,
     lr_factor: float = 0.5,
     lr_min: float = 1e-5,
@@ -978,6 +990,10 @@ def run_noise_inject_calib(
     matcher_color_lr_scale: float = 1.0,
     matcher_adjacent_color_supervision: bool = False,
     matcher_adjacent_color_weight: float = 1.0,
+    disable_depth_during_color_warmup: bool = False,
+    matcher_dense_mode: bool = False,
+    matcher_dense_stride: int = 4,
+    matcher_dense_cert_threshold: float = 0.02,
 ):
     """Continuous calibration training loop.
 
@@ -1087,7 +1103,11 @@ def run_noise_inject_calib(
             )
             print(blue("[NoiseInject] Camera supervision is matcher-only; photometric RGB loss is disabled"))
         if matcher_color_supervision:
-            print(blue(f"[NoiseInject] Matcher color supervision enabled — sparse color loss weight={matcher_color_weight:.3f}"))
+            dense_info = (
+                f" [DENSE stride={matcher_dense_stride} cert≥{matcher_dense_cert_threshold}]"
+                if matcher_dense_mode else " [sparse]"
+            )
+            print(blue(f"[NoiseInject] Matcher color supervision enabled — sparse color loss weight={matcher_color_weight:.3f}{dense_info}"))
         if matcher_adjacent_color_supervision:
             print(
                 blue(
@@ -1097,8 +1117,12 @@ def run_noise_inject_calib(
             )
     if camera_rgb_pose_only:
         print(blue("[NoiseInject] Full-image camera RGB loss updates POSE only"))
+    if freeze_translation:
+        print(blue("[NoiseInject] Translation FROZEN — keep initialized translation fixed during training"))
     if color_warmup_cycles > 0:
         print(blue(f"[NoiseInject] Color warmup enabled for first {color_warmup_cycles} cycles (RGB losses update colors only)"))
+    if disable_depth_during_color_warmup:
+        print(blue("[NoiseInject] LiDAR depth supervision disabled during color warmup"))
     if matcher_adjacent_support:
         print(blue(f"[NoiseInject] Adjacent-frame RGB support enabled (offset={matcher_adjacent_max_offset}, radius={matcher_support_radius_px:.1f}px)"))
     if post_warmup_rgb_reg_scale > 0:
@@ -1160,7 +1184,7 @@ def run_noise_inject_calib(
         optimizer_param_groups.append(
             {"params": [pose_correction.delta_rotations_quat], "lr": rotation_lr}
         )
-    if not pose_correction.use_gt_translation and not two_stage:
+    if not pose_correction.use_gt_translation and not two_stage and not freeze_translation:
         optimizer_param_groups.append(
             {"params": [pose_correction.delta_translations], "lr": translation_lr}
         )
@@ -1289,6 +1313,7 @@ def run_noise_inject_calib(
             depth_active = (
                 not freeze_gaussians
                 and (disable_depth_after_cycle <= 0 or cycle <= disable_depth_after_cycle)
+                and not (disable_depth_during_color_warmup and color_warmup_active)
             )
             if depth_active:
                 render_pkg = raytracing(
@@ -1363,6 +1388,9 @@ def run_noise_inject_calib(
                             matcher_color_weight=matcher_color_weight,
                             temporal_support_points=get_temporal_support(frame),
                             temporal_support_radius_px=matcher_support_radius_px,
+                            dense_mode=matcher_dense_mode,
+                            dense_stride=matcher_dense_stride,
+                            dense_cert_threshold=matcher_dense_cert_threshold,
                         )
                         if (
                             post_warmup_rgb_reg_scale > 0.0
@@ -1655,6 +1683,8 @@ def main():
                         help="Freeze pose optimizer for this many cycles at the start. Default: 0.")
     parser.add_argument("--freeze_rotation",       action="store_true",
                         help="Freeze rotation, optimise translation only.")
+    parser.add_argument("--freeze_translation",    action="store_true",
+                        help="Freeze translation, keeping the initialized translation fixed while optimizing other variables.")
     parser.add_argument("--lr_patience",          type=int,   default=0,
                         help="ReduceLROnPlateau patience (cycles). 0 = disabled.")
     parser.add_argument("--lr_factor",            type=float, default=0.5,
@@ -1705,6 +1735,8 @@ def main():
                         help="Add sparse adjacent-frame RGB-RGB matcher supervision on rendered colors.")
     parser.add_argument("--matcher_adjacent_color_weight", type=float, default=1.0,
                         help="Weight for adjacent-frame RGB-RGB matcher color supervision.")
+    parser.add_argument("--disable_depth_during_color_warmup", action="store_true",
+                        help="Disable LiDAR depth/raytracing supervision during color warmup cycles to reduce cost and interference.")
     parser.add_argument("--post_warmup_rgb_reg_scale", type=float, default=0.0,
                         help="After color warmup, add a full-image RGB L1+SSIM regularizer on colors only, weighted by supervised_ratio * this scale.")
     parser.add_argument("--matcher_update_interval", type=int, default=None,
@@ -1715,6 +1747,14 @@ def main():
                         help="Matcher backend for cycle pose update. Currently only matchanything-roma is supported.")
     parser.add_argument("--matcher_max_num_keypoints", type=int, default=None)
     parser.add_argument("--matcher_min_matches", type=int, default=None)
+    parser.add_argument("--matcher_dense_mode", action="store_true",
+                        help="Use RoMa dense warp field for cross-modal matching instead of sparse keypoint sampling. "
+                             "Gives ~10-100x more supervision pixels per frame.")
+    parser.add_argument("--matcher_dense_stride", type=int, default=4,
+                        help="Pixel stride for the dense query grid (default 4 = every 4th pixel). "
+                             "Smaller = denser but slower per-iter matching.")
+    parser.add_argument("--matcher_dense_cert_threshold", type=float, default=0.02,
+                        help="Minimum RoMa certainty to keep a dense match (default 0.02).")
     parser.add_argument("--matcher_min_depth_matches", type=int, default=None)
     parser.add_argument("--matcher_min_pnp_inliers", type=int, default=None)
     parser.add_argument("--matcher_ransac_reproj_thresh", type=float, default=None)
@@ -1945,6 +1985,7 @@ def main():
         translation_start_cycle=cli.translation_start_cycle,
         warmup_cycles=cli.warmup_cycles,
         freeze_rotation=cli.freeze_rotation,
+        freeze_translation=cli.freeze_translation,
         lr_patience=cli.lr_patience,
         lr_factor=cli.lr_factor,
         lr_min=cli.lr_min,
@@ -1969,6 +2010,7 @@ def main():
         matcher_support_radius_px=cli.matcher_support_radius_px,
         matcher_adjacent_color_supervision=cli.matcher_adjacent_color_supervision,
         matcher_adjacent_color_weight=cli.matcher_adjacent_color_weight,
+        disable_depth_during_color_warmup=cli.disable_depth_during_color_warmup,
         post_warmup_rgb_reg_scale=cli.post_warmup_rgb_reg_scale,
         matcher_color_lr_scale=cli.matcher_color_lr_scale,
         matcher_update_interval=cli.matcher_update_interval if cli.matcher_update_interval is not None else int(getattr(pose_cfg, "matcher_update_interval", 1)),
@@ -1987,6 +2029,9 @@ def main():
         matcher_depth_percentile_low=cli.matcher_depth_percentile_low if cli.matcher_depth_percentile_low is not None else float(getattr(pose_cfg, "matcher_depth_percentile_low", 5.0)),
         matcher_depth_percentile_high=cli.matcher_depth_percentile_high if cli.matcher_depth_percentile_high is not None else float(getattr(pose_cfg, "matcher_depth_percentile_high", 95.0)),
         lidar_updates_opacity_covariance_only=cli.lidar_updates_opacity_covariance_only,
+        matcher_dense_mode=cli.matcher_dense_mode,
+        matcher_dense_stride=cli.matcher_dense_stride,
+        matcher_dense_cert_threshold=cli.matcher_dense_cert_threshold,
     )
 
     _save_run_visualizations(

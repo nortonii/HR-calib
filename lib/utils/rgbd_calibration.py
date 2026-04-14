@@ -302,6 +302,79 @@ def match_cross_modal(matcher, rgb_image: np.ndarray, depth_image: np.ndarray) -
     return rgb_points, depth_points, result
 
 
+def match_cross_modal_dense(
+    matcher,
+    rgb_image: np.ndarray,
+    depth_image: np.ndarray,
+    query_stride: int = 4,
+    cert_threshold: float = 0.02,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Dense cross-modal matching using RoMa's dense warp field.
+
+    Bypasses the sparse keypoint sampling limit (max_num_keypoints) and instead
+    queries the full dense warp field at a strided grid of pixels from the RGB
+    image.  This yields ~10-100x more supervision points than sparse matching.
+
+    Args:
+        matcher: MatchAnythingMatcher with variant="roma" (built by build_matcher).
+        rgb_image: RGB image, HWC uint8 or CHW/HWC float [0, 1].
+        depth_image: Depth colormap, same format.
+        query_stride: Sample every N pixels along both axes of the RGB image.
+                      stride=1 is fully dense; stride=4 gives 16x less points.
+        cert_threshold: Minimum RoMa certainty score to keep a correspondence.
+
+    Returns:
+        rgb_points:   [N, 2] float64, (x, y) pixel coords in the RGB image.
+        depth_points: [N, 2] float64, (x, y) pixel coords in the depth colormap.
+        certainties:  [N]   float32,  per-point certainty from the warp field.
+    """
+    import torch
+
+    net = matcher.net          # MatchAnything_Model
+    roma_model = net.model     # RegressionMatcher
+
+    img0_chw = _format_matcher_image(rgb_image)   # [3, H, W] float32 [0,1]
+    img1_chw = _format_matcher_image(depth_image)  # [3, H, W] float32 [0,1]
+
+    H_A, W_A = int(img0_chw.shape[1]), int(img0_chw.shape[2])
+    H_B, W_B = int(img1_chw.shape[1]), int(img1_chw.shape[2])
+
+    img0_t = torch.from_numpy(img0_chw).to(matcher.device)
+    img1_t = torch.from_numpy(img1_chw).to(matcher.device)
+
+    with torch.no_grad():
+        warp, dense_certainty = roma_model.self_inference_time_match(
+            img0_t,
+            img1_t,
+            resize_by_stretch=net.resize_by_stretch,
+            norm_img=net.norm_image,
+        )
+
+        # Build strided query grid in RGB-image pixel space (x, y)
+        ys = np.arange(0, H_A, query_stride, dtype=np.float32)
+        xs = np.arange(0, W_A, query_stride, dtype=np.float32)
+        grid_y, grid_x = np.meshgrid(ys, xs, indexing="ij")
+        query_pts = torch.from_numpy(
+            np.stack([grid_x.ravel(), grid_y.ravel()], axis=-1)  # [N, 2] (x, y)
+        ).float().to(matcher.device)
+
+        warped_pts, certs = roma_model.warp_keypoints(
+            query_pts, warp, dense_certainty, H_A, W_A, H_B, W_B
+        )
+
+    q_np = query_pts.cpu().numpy().astype(np.float64)       # [N, 2]
+    w_np = warped_pts.cpu().numpy().astype(np.float64)      # [N, 2]
+    c_np = certs.cpu().numpy().astype(np.float32)           # [N]
+
+    valid = (
+        (c_np >= cert_threshold)
+        & (w_np[:, 0] >= 0) & (w_np[:, 0] <= W_B - 1)
+        & (w_np[:, 1] >= 0) & (w_np[:, 1] <= H_B - 1)
+    )
+
+    return q_np[valid], w_np[valid], c_np[valid]
+
+
 def match_temporal_frames(
     matcher,
     rgb_images: list[np.ndarray],
