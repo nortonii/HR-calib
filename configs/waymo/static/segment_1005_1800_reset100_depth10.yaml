@@ -1,0 +1,22 @@
+parent_config: "configs/waymo/static/segment_1005.yaml"
+
+# Best-recipe run (mirrors KITTI kc_5_50_t_1800_reset100_depth10):
+# 1800 cycles, Gaussian reset every 100, depth disabled after cycle 10.
+# Launch with:
+#
+#   EXP=output/waymo_1800_reset100_depth10
+#   mkdir -p $EXP
+#   python -u tools/calib.py \
+#     -dc configs/waymo/static/segment_1005_1800_reset100_depth10.yaml \
+#     -ec configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml \
+#     --init_rot_deg 5.0 --init_rot_axis 0.5774 0.5774 0.5774 \
+#     --use_gt_translation \
+#     --total_cycles 1800 --iters_per_cycle 150 \
+#     --rotation_lr 0.002 \
+#     --warmup_cycles 1 \
+#     --reset_gaussians_every 100 \
+#     --disable_depth_after_cycle 10 \
+#     --output_dir $EXP \
+#     2>&1 | tee $EXP/train.log
+
+scene_id: waymo_segment_1005_1800_reset100_depth10

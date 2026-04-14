@@ -1,0 +1,11 @@
+parent_config: "configs/waymo/waymo_base.yaml"
+source_dir: "data/waymo/segment-1005"
+
+frame_length: [0, 49]
+eval_frames: [0, 10, 20, 30, 40]
+
+scene_id: waymo_segment_1005
+
+dynamic: False
+waymo_camera_id: 1
+camera_scale: 4

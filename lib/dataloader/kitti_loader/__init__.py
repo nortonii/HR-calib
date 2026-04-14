@@ -69,8 +69,9 @@ def load_ego2world(file_path):
         parts = line.split()
         frame = int(parts[0])
         values = [float(x) for x in parts[1:]]
-        matrix = np.array(values).reshape(3, 4)  # (3, 4)
-        ego2world[frame] = matrix
+        mat4 = np.eye(4)
+        mat4[:3, :] = np.array(values).reshape(3, 4)
+        ego2world[frame] = mat4
 
     return ego2world
 
@@ -273,7 +274,19 @@ def load_kitti360_cameras(
 
     cam2world_by_frame = _load_cam0_to_world(pose_file)
 
-    cache_dir = os.path.join(base_dir, f"cache_cam_kitti360_s{scale}")
+    # World-centering: subtract the same ego world origin used by load_kitti_raw
+    # so camera poses are in the same centered coordinate frame as the LiDAR.
+    world_origin_path = os.path.join(base_dir, "cache", f"world_origin_seq{seq_num}.pt")
+    if os.path.exists(world_origin_path):
+        world_origin = torch.load(world_origin_path, weights_only=True).numpy()
+    else:
+        # Fallback: use first available cam2world translation
+        available = sorted(cam2world_by_frame.keys())
+        world_origin = cam2world_by_frame[available[0]][:3, 3].copy()
+    for f in cam2world_by_frame:
+        cam2world_by_frame[f][:3, 3] -= world_origin
+
+    cache_dir = os.path.join(base_dir, f"cache_cam_kitti360_s{scale}_v2")
     meta_file = os.path.join(cache_dir, "meta.json")
     os.makedirs(cache_dir, exist_ok=True)
     meta = {"W": W, "H": H, "undistorted": True, "method": "undistort_K_raw"}
@@ -375,6 +388,20 @@ def load_kitti_raw(base_dir, args):
 
     ego2world = load_ego2world(pose_file)
 
+    # World-centering: subtract first frame's ego translation so all poses are
+    # relative to the starting position. This prevents UTM-scale coordinates
+    # (~2700 m) from causing gradient explosion during optimization.
+    if kitti_seq is not None:
+        sorted_ego_frames = sorted(ego2world.keys())
+        world_origin = ego2world[sorted_ego_frames[0]][:3, 3].copy()
+        for f in ego2world:
+            ego2world[f][:3, 3] -= world_origin
+        origin_cache_dir = os.path.join(base_dir, "cache")
+        os.makedirs(origin_cache_dir, exist_ok=True)
+        world_origin_path = os.path.join(origin_cache_dir, f"world_origin_seq{seq_num}.pt")
+        torch.save(torch.tensor(world_origin, dtype=torch.float32), world_origin_path)
+        print(blue(f"[KITTI-360] World origin saved: {world_origin.tolist()}"))
+
     W, H = 1030, 66
     inc_buttom, inc_top = math.radians(-24.9), math.radians(2.0)
     azimuth_left, azimuth_right = np.pi, -np.pi
@@ -400,32 +427,28 @@ def load_kitti_raw(base_dir, args):
     for frame in frame_ids:
         prev_ego2world = last_ego2world
         xyzs, intensities = lidar_points[frame][:, :3], lidar_points[frame][:, 3]
-        x, y, z = xyzs[:, 0], xyzs[:, 1], xyzs[:, 2]
-        dists = np.linalg.norm(lidar_points[frame][:, :3], axis=1)
+        dists = np.linalg.norm(xyzs, axis=1)
 
-        range_map = np.ones((H, W)) * -1
-        intensity_map = np.ones((H, W)) * -1
+        # Vectorized range-image construction (replaces slow per-point Python loop)
+        valid = dists <= max_depth
+        xyzs_v, ints_v, dists_v = xyzs[valid], intensities[valid], dists[valid]
+        azimuth = np.arctan2(xyzs_v[:, 1], xyzs_v[:, 0])
+        inclination = np.arctan2(xyzs_v[:, 2],
+                                  np.sqrt(xyzs_v[:, 0]**2 + xyzs_v[:, 1]**2))
+        w_idx = np.round((azimuth - azimuth_left) / h_res).astype(int)
+        h_idx = np.round((inclination - inc_top) / v_res).astype(int)
+        in_bounds = (w_idx >= 0) & (w_idx < W) & (h_idx >= 0) & (h_idx < H)
+        w_idx, h_idx = w_idx[in_bounds], h_idx[in_bounds]
+        dists_v, ints_v = dists_v[in_bounds], ints_v[in_bounds]
 
-        for xyz, intensity, dist in zip(xyzs, intensities, dists):
-            x, y, z = xyz
-            azimuth = np.arctan2(y, x)
-            inclination = np.arctan2(z, np.sqrt(x**2 + y**2))
-
-            if dist > max_depth:
-                continue
-
-            w_idx = np.round((azimuth - azimuth_left) / h_res).astype(int)
-            h_idx = np.round((inclination - inc_top) / v_res).astype(int)
-
-            if (w_idx < 0) or (w_idx >= W) or (h_idx < 0) or (h_idx >= H):
-                continue
-
-            if range_map[h_idx, w_idx] == -1:
-                range_map[h_idx, w_idx] = dist
-                intensity_map[h_idx, w_idx] = intensity
-            elif range_map[h_idx, w_idx] > dist:
-                range_map[h_idx, w_idx] = dist
-                intensity_map[h_idx, w_idx] = intensity
+        range_map = np.full((H, W), -1.0)
+        intensity_map = np.full((H, W), -1.0)
+        # Fill closest point per pixel (sort by distance ascending so last write wins
+        # when we use a flat-index scatter with minimum semantics)
+        order = np.argsort(dists_v)[::-1]  # farthest first → nearest overwrites
+        flat = h_idx[order] * W + w_idx[order]
+        range_map.flat[flat] = dists_v[order]
+        intensity_map.flat[flat] = ints_v[order]
 
         range_image_r1 = np.stack([range_map, intensity_map], axis=-1)
         range_image_r2 = np.ones_like(range_image_r1) * -1

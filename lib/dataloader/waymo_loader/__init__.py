@@ -48,6 +48,22 @@ def load_waymo_raw(base_dir, args):
     lidar: LiDARSensor = None
     bboxes: Dict[str, BoundingBox] = {}  # frame * n
 
+    # Centre all world poses on the first frame's ego position so that
+    # world-frame coordinates are small (~metres from the vehicle start).
+    # Waymo ego2world uses absolute UTM-like coordinates (|T| > 10 km),
+    # which causes ~10 000× gradient amplification and rotation divergence.
+    first_record = dataset[args.frame_length[0]]
+    first_frame_data = dataset_pb2.Frame()
+    first_frame_data.ParseFromString(bytearray(first_record.numpy()))
+    world_origin = torch.tensor(
+        first_frame_data.pose.transform, dtype=torch.float32
+    ).reshape(4, 4)[:3, 3].clone()
+
+    # Persist origin so load_waymo_cameras can use the same reference.
+    cache_dir = os.path.join(base_dir, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    torch.save(world_origin, os.path.join(cache_dir, "world_origin.pt"))
+
     pbar = tqdm(total=(args.frame_length[1] + 1 - args.frame_length[0]))
     for frame in range(args.frame_length[0], args.frame_length[1] + 1):
         record = dataset[frame]
@@ -83,6 +99,9 @@ def load_waymo_raw(base_dir, args):
             ego2world = torch.tensor(
                 frame_data.pose.transform, dtype=torch.float32
             ).reshape(4, 4)
+            # Subtract world origin so all positions are relative to first frame.
+            ego2world = ego2world.clone()
+            ego2world[:3, 3] -= world_origin
 
             decompressed_dir = f"{base_dir}/cache"
             os.makedirs(decompressed_dir, exist_ok=True)
@@ -187,7 +206,7 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
     FoVx = 2.0 * math.atan(W / (2.0 * fx * sx))
     FoVy = 2.0 * math.atan(H / (2.0 * fy * sx))
 
-    cam_cache_dir = os.path.join(base_dir, f"cache_cam{camera_id}_s{scale}")
+    cam_cache_dir = os.path.join(base_dir, f"cache_cam{camera_id}_s{scale}_v2")
     os.makedirs(cam_cache_dir, exist_ok=True)
 
     cameras: Dict[int, Camera] = {}
@@ -205,6 +224,19 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
     # cam2world_opencv = cam2world_waymo @ R_wc2oc.T
     # (converts cam2world so that z-axis is the look direction)
 
+    # Load the world origin saved by load_waymo_raw for consistent centering.
+    # If not found (e.g. cache was cleared), compute it from the first frame.
+    world_origin_path = os.path.join(base_dir, "cache", "world_origin.pt")
+    if os.path.exists(world_origin_path):
+        world_origin = torch.load(world_origin_path)
+    else:
+        ref_record = dataset[args.frame_length[0]]
+        ref_frame_data = dataset_pb2.Frame()
+        ref_frame_data.ParseFromString(bytearray(ref_record.numpy()))
+        world_origin = torch.tensor(
+            list(ref_frame_data.pose.transform), dtype=torch.float32
+        ).reshape(4, 4)[:3, 3].clone()
+
     for frame in range(args.frame_length[0], args.frame_length[1] + 1):
         cache_path = os.path.join(cam_cache_dir, f"frame_{frame}.pt")
         if os.path.exists(cache_path):
@@ -218,6 +250,10 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
             ego2world = torch.tensor(
                 list(frame_data.pose.transform), dtype=torch.float32
             ).reshape(4, 4)
+            # Centre on the first frame's ego position (same shift as load_waymo_raw).
+            ego2world = ego2world.clone()
+            ego2world[:3, 3] -= world_origin
+
             cam2world_waymo = ego2world @ cam2ego  # (4, 4)
             # Convert to OpenCV camera convention (z-forward)
             cam2world = cam2world_waymo.clone()
