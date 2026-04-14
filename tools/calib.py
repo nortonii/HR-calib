@@ -1536,7 +1536,14 @@ def run_noise_inject_calib(
                 )
 
         # ── Per-cycle match precomputation ────────────────────
-        if match_once_per_cycle and matcher is not None and (matcher_color_supervision or matcher_adjacent_color_supervision):
+        # During color warmup, Gaussian geometry is frozen so rendered depth is stable —
+        # reuse cycle 1's cache for all subsequent warmup cycles (no re-matching needed).
+        warmup_active_now = bool(color_warmup_cycles > 0 and cycle <= color_warmup_cycles)
+        skip_precompute = (match_once_per_cycle and cycle_match_cache
+                           and warmup_active_now)
+        if skip_precompute:
+            print(f"[Cycle cache] warmup cycle {cycle}: reusing cached matches (depth unchanged)")
+        elif match_once_per_cycle and matcher is not None and (matcher_color_supervision or matcher_adjacent_color_supervision):
             cycle_match_cache = _precompute_cycle_match_cache(
                 matcher=matcher,
                 gaussians=gaussians,
