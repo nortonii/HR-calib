@@ -595,6 +595,17 @@ def _precompute_cycle_match_cache(
             "depth_pts": depth_pts_f[valid_mask],
             "gt_colors": gt_colors[gt_valid].detach().cpu(),
         }
+    if cache:
+        total_pts = sum(v["depth_pts"].shape[0] for v in cache.values())
+        frames_hit = len(cache)
+        # Image size from any camera
+        sample_cam = next(iter(cam_cameras.values()))
+        h, w = int(sample_cam.image_height), int(sample_cam.image_width)
+        pixels_per_frame = h * w
+        avg_pts = total_pts / frames_hit
+        avg_coverage = avg_pts / pixels_per_frame * 100.0
+        print(f"[Cycle cache] {frames_hit} frames, avg {avg_pts:.0f} matches/frame "
+              f"({avg_coverage:.1f}% pixel coverage, image {w}×{h})")
     return cache
 
 
@@ -706,8 +717,11 @@ def _apply_adjacent_cache_loss(
             continue
 
         # cur_pred vs nbr_gt  and  nbr_pred vs cur_gt
-        cur_gt_dev = cur_gt_colors[valid[cur_pred_valid]].to(pred_rgb.device)
-        nbr_gt_dev = nbr_gt_colors[valid[nbr_pred_valid]].to(pred_rgb.device)
+        # cur/nbr_gt_colors are [N,3] on CPU — index with full valid mask (moved to cpu)
+        # cur/nbr_pred_colors are [cur/nbr_pred_valid.sum(),3] — sub-index within that
+        valid_cpu = valid.cpu()
+        cur_gt_dev = cur_gt_colors[valid_cpu].to(pred_rgb.device)
+        nbr_gt_dev = nbr_gt_colors[valid_cpu].to(pred_rgb.device)
         cur_pred_v = cur_pred_colors[valid[cur_pred_valid]]
         nbr_pred_v = nbr_pred_colors[valid[nbr_pred_valid]]
 
