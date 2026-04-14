@@ -500,6 +500,230 @@ def _compute_adjacent_matcher_color_loss(
 
 
 @torch.no_grad()
+def _precompute_cycle_match_cache(
+    matcher,
+    gaussians,
+    pose_correction,
+    cam_cameras: dict,
+    cam_images: dict,
+    frame_ids: list[int],
+    args,
+    matcher_min_matches: int,
+    matcher_min_depth_matches: int,
+    matcher_depth_min: float,
+    matcher_depth_max: float,
+    matcher_depth_percentile_low: float,
+    matcher_depth_percentile_high: float,
+    matcher_depth_use_inverse: bool,
+    temporal_support_getter=None,
+    temporal_support_radius_px: float = 6.0,
+    dense_mode: bool = False,
+    dense_stride: int = 4,
+    dense_cert_threshold: float = 0.02,
+) -> dict:
+    """Run cross-modal matching once per cycle for all train frames.
+
+    Returns a dict keyed by frame_id with:
+      - 'depth_pts': np.ndarray [N, 2]  pixel coords in the rendered image
+      - 'gt_colors': torch.Tensor [N, 3] (CPU) GT RGB at matched rgb_pts
+    """
+    cache = {}
+    for frame in frame_ids:
+        if frame not in cam_cameras or frame not in cam_images:
+            continue
+        cam_R, cam_T = pose_correction.corrected_rt(frame, device="cuda")
+        camera = cam_cameras[frame].cuda()
+        gt_rgb = cam_images[frame].cuda()
+
+        depth_render = _render_camera_with_backend(
+            camera, [gaussians], args,
+            backend="surfel_rasterization",
+            cam_rotation=cam_R.detach(),
+            cam_translation=cam_T.detach(),
+            require_rgb=False,
+        )
+        if not int(depth_render.get("num_visible", 0)):
+            continue
+
+        depth_np = depth_render["depth"].squeeze(-1).cpu().numpy().astype(np.float32)
+        depth_vis = depth_to_match_image(
+            depth_np,
+            percentile_low=matcher_depth_percentile_low,
+            percentile_high=matcher_depth_percentile_high,
+            use_inverse=matcher_depth_use_inverse,
+        )
+        gt_rgb_np = _to_uint8_rgb(gt_rgb)
+
+        if dense_mode:
+            rgb_pts, depth_pts, _ = match_cross_modal_dense(
+                matcher, gt_rgb_np, depth_vis,
+                query_stride=dense_stride,
+                cert_threshold=dense_cert_threshold,
+            )
+        else:
+            rgb_pts, depth_pts, _ = match_cross_modal(matcher, gt_rgb_np, depth_vis)
+
+        if temporal_support_getter is not None:
+            support = temporal_support_getter(frame)
+            if support is not None and support.shape[0] > 0:
+                mask = _filter_points_by_support(rgb_pts, support, temporal_support_radius_px)
+                rgb_pts = rgb_pts[mask]
+                depth_pts = depth_pts[mask]
+
+        if rgb_pts.shape[0] < int(matcher_min_matches):
+            continue
+
+        keep_indices, _ = sample_depth_values(
+            depth_map=depth_np,
+            points=np.asarray(depth_pts, dtype=np.float64),
+            min_depth=matcher_depth_min,
+            max_depth=matcher_depth_max,
+            search_radius=2,
+        )
+        if keep_indices.shape[0] < int(matcher_min_depth_matches):
+            continue
+
+        rgb_pts_f = np.asarray(rgb_pts[keep_indices], dtype=np.float32)
+        depth_pts_f = np.asarray(depth_pts[keep_indices], dtype=np.float32)
+
+        gt_colors, gt_valid = _sample_image_colors(gt_rgb, rgb_pts_f)
+        valid_mask = gt_valid.cpu().numpy().astype(bool)
+        if int(valid_mask.sum()) < int(matcher_min_depth_matches):
+            continue
+
+        cache[frame] = {
+            "depth_pts": depth_pts_f[valid_mask],
+            "gt_colors": gt_colors[gt_valid].detach().cpu(),
+        }
+    return cache
+
+
+def _apply_cross_modal_cache_loss(
+    pred_rgb: torch.Tensor,
+    cache_entry: dict,
+    matcher_color_weight: float,
+) -> tuple[torch.Tensor, dict]:
+    """Compute match color loss using precomputed (depth_pts, gt_colors) cache."""
+    depth_pts = cache_entry["depth_pts"]
+    gt_colors = cache_entry["gt_colors"].to(pred_rgb.device)
+
+    pred_colors, pred_valid = _sample_image_colors(pred_rgb, depth_pts)
+    gt_colors_valid = gt_colors[pred_valid]
+    pred_colors_valid = pred_colors[pred_valid]
+
+    n = int(pred_colors_valid.shape[0])
+    if n < 5:
+        return pred_rgb.new_zeros(()), {"status": "skipped", "reason": "too_few_valid_samples", "matches": n}
+
+    loss = float(matcher_color_weight) * F.l1_loss(pred_colors_valid, gt_colors_valid)
+    mae = torch.mean(torch.abs(pred_colors_valid.detach() - gt_colors_valid.detach())).item()
+    return loss, {
+        "status": "applied",
+        "matches": n,
+        "raw_matches": n,
+        "supervised_ratio": float(n) / float(max(pred_rgb.shape[0] * pred_rgb.shape[1], 1)),
+        "mae": float(mae),
+    }
+
+
+def _precompute_adjacent_gt_cache(
+    temporal_pair_cache: dict,
+    cam_images: dict,
+) -> dict:
+    """For each frame that already has temporal pairs cached, sample GT colors at
+    the matched pixel locations on both sides.  Returns:
+      {frame: [(neighbor, pts_cur, cur_gt_colors_cpu, pts_nbr, nbr_gt_colors_cpu), ...]}
+    """
+    adj_cache: dict[int, list] = {}
+    for frame, pairs in temporal_pair_cache.items():
+        if frame not in cam_images:
+            continue
+        cur_gt = cam_images[frame].cpu()
+        entries = []
+        for neighbor, pts_cur, pts_nbr in pairs:
+            if neighbor not in cam_images:
+                continue
+            nbr_gt = cam_images[neighbor].cpu()
+            cur_gt_colors, cur_valid = _sample_image_colors(cur_gt, pts_cur)
+            nbr_gt_colors, nbr_valid = _sample_image_colors(nbr_gt, pts_nbr)
+            valid = cur_valid & nbr_valid
+            if not torch.any(valid):
+                continue
+            valid_np = valid.numpy().astype(bool)
+            # pts_cur/pts_nbr are [N,2], valid is [N] — direct mask works
+            # cur/nbr_gt_colors are pre-indexed to cur_valid/nbr_valid, so sub-index within those
+            entries.append((
+                int(neighbor),
+                pts_cur[valid_np],
+                cur_gt_colors[valid[cur_valid]].detach(),
+                pts_nbr[valid_np],
+                nbr_gt_colors[valid[nbr_valid]].detach(),
+            ))
+        if entries:
+            adj_cache[frame] = entries
+    return adj_cache
+
+
+def _apply_adjacent_cache_loss(
+    frame: int,
+    pred_rgb: torch.Tensor,
+    gaussians,
+    pose_correction,
+    cam_cameras: dict,
+    args,
+    adj_gt_cache: dict,
+    adjacent_color_weight: float,
+    matcher_min_matches: int,
+) -> tuple[torch.Tensor, dict]:
+    """Adjacent color loss using precomputed GT color targets."""
+    if frame not in adj_gt_cache:
+        return pred_rgb.new_zeros(()), {"status": "skipped", "reason": "no_adjacent_cache"}
+
+    total_loss = pred_rgb.new_zeros(())
+    pair_count = 0
+    total_matches = 0
+
+    for neighbor, pts_cur, cur_gt_colors, pts_nbr, nbr_gt_colors in adj_gt_cache[frame]:
+        if neighbor not in cam_cameras:
+            continue
+        nbr_R, nbr_T = pose_correction.corrected_rt(neighbor, device="cuda")
+        nbr_render = render_camera(
+            cam_cameras[neighbor].cuda(), [gaussians], args,
+            cam_rotation=nbr_R.detach(),
+            cam_translation=nbr_T.detach(),
+            require_rgb=True,
+        )
+        if int(nbr_render.get("num_visible", 0)) <= 0:
+            continue
+        nbr_pred = nbr_render["rgb"].clamp(0.0, 1.0)
+
+        cur_pred_colors, cur_pred_valid = _sample_image_colors(pred_rgb, pts_cur)
+        nbr_pred_colors, nbr_pred_valid = _sample_image_colors(nbr_pred, pts_nbr)
+
+        valid = cur_pred_valid & nbr_pred_valid
+        n = int(valid.sum().item())
+        if n < int(matcher_min_matches):
+            continue
+
+        # cur_pred vs nbr_gt  and  nbr_pred vs cur_gt
+        cur_gt_dev = cur_gt_colors[valid[cur_pred_valid]].to(pred_rgb.device)
+        nbr_gt_dev = nbr_gt_colors[valid[nbr_pred_valid]].to(pred_rgb.device)
+        cur_pred_v = cur_pred_colors[valid[cur_pred_valid]]
+        nbr_pred_v = nbr_pred_colors[valid[nbr_pred_valid]]
+
+        pair_loss = 0.5 * (F.l1_loss(cur_pred_v, nbr_gt_dev) + F.l1_loss(nbr_pred_v, cur_gt_dev))
+        total_loss = total_loss + pair_loss
+        pair_count += 1
+        total_matches += n
+
+    if pair_count == 0:
+        return pred_rgb.new_zeros(()), {"status": "skipped", "reason": "too_few_adjacent_matches"}
+
+    total_loss = float(adjacent_color_weight) * (total_loss / float(pair_count))
+    return total_loss, {"status": "applied", "pairs": pair_count, "matches": total_matches}
+
+
+@torch.no_grad()
 def _run_matcher_pose_update(
     matcher,
     gaussians,
@@ -994,6 +1218,7 @@ def run_noise_inject_calib(
     matcher_dense_mode: bool = False,
     matcher_dense_stride: int = 4,
     matcher_dense_cert_threshold: float = 0.02,
+    match_once_per_cycle: bool = True,
 ):
     """Continuous calibration training loop.
 
@@ -1026,6 +1251,8 @@ def run_noise_inject_calib(
     matcher = None
     temporal_support_cache: dict[int, np.ndarray] = {}
     temporal_pair_cache: dict[int, list[tuple[int, np.ndarray, np.ndarray]]] = {}
+    cycle_match_cache: dict[int, dict] = {}   # precomputed cross-modal targets, refreshed each cycle
+    adj_gt_cache: dict[int, list] = {}         # precomputed adjacent GT colors, built once
 
     if lidar_updates_opacity_covariance_only:
         freeze_xyz = True
@@ -1293,6 +1520,33 @@ def run_noise_inject_calib(
                     patience=lr_patience, min_lr=lr_min, threshold=1e-3,
                 )
 
+        # ── Per-cycle match precomputation ────────────────────
+        if match_once_per_cycle and matcher is not None and (matcher_color_supervision or matcher_adjacent_color_supervision):
+            cycle_match_cache = _precompute_cycle_match_cache(
+                matcher=matcher,
+                gaussians=gaussians,
+                pose_correction=pose_correction,
+                cam_cameras=cam_cameras,
+                cam_images=cam_images,
+                frame_ids=[f for f in frame_ids_train if f in cam_cameras],
+                args=args,
+                matcher_min_matches=matcher_min_matches,
+                matcher_min_depth_matches=matcher_min_depth_matches,
+                matcher_depth_min=matcher_depth_min,
+                matcher_depth_max=matcher_depth_max,
+                matcher_depth_percentile_low=matcher_depth_percentile_low,
+                matcher_depth_percentile_high=matcher_depth_percentile_high,
+                matcher_depth_use_inverse=matcher_depth_use_inverse,
+                temporal_support_getter=get_temporal_support if matcher_adjacent_support else None,
+                temporal_support_radius_px=matcher_support_radius_px,
+                dense_mode=matcher_dense_mode,
+                dense_stride=matcher_dense_stride,
+                dense_cert_threshold=matcher_dense_cert_threshold,
+            )
+            # Build adjacent GT color cache lazily (GT images never change)
+            if matcher_adjacent_color_supervision and temporal_pair_cache and not adj_gt_cache:
+                adj_gt_cache = _precompute_adjacent_gt_cache(temporal_pair_cache, cam_images)
+
         for it in range(1, iters_per_cycle + 1):
             global_iter += 1
             gaussian_iter += 1
@@ -1355,69 +1609,99 @@ def run_noise_inject_calib(
                     psnr_accum += psnr(pred_chw, gt_chw).item()
                     psnr_count += 1
                 if matcher_color_supervision:
-                    depth_render = _render_camera_with_backend(
-                        camera,
-                        [gaussians],
-                        args,
-                        backend="surfel_rasterization",
-                        cam_rotation=cam_R.detach(),
-                        cam_translation=cam_T.detach(),
-                        require_rgb=False,
-                    )
-                    color_render = render_camera(
-                        camera,
-                        [gaussians],
-                        args,
-                        cam_rotation=cam_R.detach(),
-                        cam_translation=cam_T.detach(),
-                        require_rgb=True,
-                    )
-                    if int(depth_render.get("num_visible", 0)) > 0 and int(color_render.get("num_visible", 0)) > 0:
-                        loss_match_color, matcher_color_summary = _compute_matcher_color_loss(
-                            matcher=matcher,
-                            gt_rgb=gt_rgb,
-                            pred_rgb=color_render["rgb"].clamp(0.0, 1.0),
-                            depth=depth_render["depth"],
-                            matcher_min_matches=matcher_min_matches,
-                            matcher_min_depth_matches=matcher_min_depth_matches,
-                            matcher_depth_min=matcher_depth_min,
-                            matcher_depth_max=matcher_depth_max,
-                            matcher_depth_percentile_low=matcher_depth_percentile_low,
-                            matcher_depth_percentile_high=matcher_depth_percentile_high,
-                            matcher_depth_use_inverse=matcher_depth_use_inverse,
-                            matcher_color_weight=matcher_color_weight,
-                            temporal_support_points=get_temporal_support(frame),
-                            temporal_support_radius_px=matcher_support_radius_px,
-                            dense_mode=matcher_dense_mode,
-                            dense_stride=matcher_dense_stride,
-                            dense_cert_threshold=matcher_dense_cert_threshold,
+                    if match_once_per_cycle and frame in cycle_match_cache:
+                        # Fast path: use precomputed match targets, only need a color render
+                        color_render = render_camera(
+                            camera,
+                            [gaussians],
+                            args,
+                            cam_rotation=cam_R.detach(),
+                            cam_translation=cam_T.detach(),
+                            require_rgb=True,
                         )
-                        if (
-                            post_warmup_rgb_reg_scale > 0.0
-                            and not color_warmup_active
-                            and base_rgb_photo_loss is not None
-                            and matcher_color_summary is not None
-                            and matcher_color_summary.get("status") == "applied"
-                        ):
-                            supervised_ratio = float(matcher_color_summary.get("supervised_ratio", 0.0))
-                            if supervised_ratio > 0.0:
-                                loss_rgb_reg = base_rgb_photo_loss * (supervised_ratio * float(post_warmup_rgb_reg_scale))
+                        if int(color_render.get("num_visible", 0)) > 0:
+                            loss_match_color, matcher_color_summary = _apply_cross_modal_cache_loss(
+                                pred_rgb=color_render["rgb"].clamp(0.0, 1.0),
+                                cache_entry=cycle_match_cache[frame],
+                                matcher_color_weight=matcher_color_weight,
+                            )
+                    else:
+                        depth_render = _render_camera_with_backend(
+                            camera,
+                            [gaussians],
+                            args,
+                            backend="surfel_rasterization",
+                            cam_rotation=cam_R.detach(),
+                            cam_translation=cam_T.detach(),
+                            require_rgb=False,
+                        )
+                        color_render = render_camera(
+                            camera,
+                            [gaussians],
+                            args,
+                            cam_rotation=cam_R.detach(),
+                            cam_translation=cam_T.detach(),
+                            require_rgb=True,
+                        )
+                        if int(depth_render.get("num_visible", 0)) > 0 and int(color_render.get("num_visible", 0)) > 0:
+                            loss_match_color, matcher_color_summary = _compute_matcher_color_loss(
+                                matcher=matcher,
+                                gt_rgb=gt_rgb,
+                                pred_rgb=color_render["rgb"].clamp(0.0, 1.0),
+                                depth=depth_render["depth"],
+                                matcher_min_matches=matcher_min_matches,
+                                matcher_min_depth_matches=matcher_min_depth_matches,
+                                matcher_depth_min=matcher_depth_min,
+                                matcher_depth_max=matcher_depth_max,
+                                matcher_depth_percentile_low=matcher_depth_percentile_low,
+                                matcher_depth_percentile_high=matcher_depth_percentile_high,
+                                matcher_depth_use_inverse=matcher_depth_use_inverse,
+                                matcher_color_weight=matcher_color_weight,
+                                temporal_support_points=get_temporal_support(frame),
+                                temporal_support_radius_px=matcher_support_radius_px,
+                                dense_mode=matcher_dense_mode,
+                                dense_stride=matcher_dense_stride,
+                                dense_cert_threshold=matcher_dense_cert_threshold,
+                            )
+                    if (
+                        post_warmup_rgb_reg_scale > 0.0
+                        and not color_warmup_active
+                        and base_rgb_photo_loss is not None
+                        and matcher_color_summary is not None
+                        and matcher_color_summary.get("status") == "applied"
+                    ):
+                        supervised_ratio = float(matcher_color_summary.get("supervised_ratio", 0.0))
+                        if supervised_ratio > 0.0:
+                            loss_rgb_reg = base_rgb_photo_loss * (supervised_ratio * float(post_warmup_rgb_reg_scale))
                 if matcher_adjacent_color_supervision and int(cam_render.get("num_visible", 0)) > 0:
-                    loss_match_adjacent, _ = _compute_adjacent_matcher_color_loss(
-                        matcher=matcher,
-                        frame=int(frame),
-                        pred_rgb=pred_rgb,
-                        gt_rgb=gt_rgb,
-                        gaussians=gaussians,
-                        pose_correction=pose_correction,
-                        cam_cameras=cam_cameras,
-                        cam_images=cam_images,
-                        args=args,
-                        temporal_pair_cache=temporal_pair_cache,
-                        matcher_adjacent_max_offset=matcher_adjacent_max_offset,
-                        matcher_min_matches=matcher_min_matches,
-                        adjacent_color_weight=matcher_adjacent_color_weight,
-                    )
+                    if match_once_per_cycle and adj_gt_cache:
+                        loss_match_adjacent, _ = _apply_adjacent_cache_loss(
+                            frame=int(frame),
+                            pred_rgb=pred_rgb,
+                            gaussians=gaussians,
+                            pose_correction=pose_correction,
+                            cam_cameras=cam_cameras,
+                            args=args,
+                            adj_gt_cache=adj_gt_cache,
+                            adjacent_color_weight=matcher_adjacent_color_weight,
+                            matcher_min_matches=matcher_min_matches,
+                        )
+                    else:
+                        loss_match_adjacent, _ = _compute_adjacent_matcher_color_loss(
+                            matcher=matcher,
+                            frame=int(frame),
+                            pred_rgb=pred_rgb,
+                            gt_rgb=gt_rgb,
+                            gaussians=gaussians,
+                            pose_correction=pose_correction,
+                            cam_cameras=cam_cameras,
+                            cam_images=cam_images,
+                            args=args,
+                            temporal_pair_cache=temporal_pair_cache,
+                            matcher_adjacent_max_offset=matcher_adjacent_max_offset,
+                            matcher_min_matches=matcher_min_matches,
+                            adjacent_color_weight=matcher_adjacent_color_weight,
+                        )
 
             total_loss = loss_depth + loss_rgb + loss_match_color + loss_match_adjacent + loss_rgb_reg
             if (freeze_covariance or rgb_only_updates_color or camera_rgb_pose_only or matcher_color_supervision or matcher_adjacent_color_supervision) and not freeze_gaussians:
@@ -1755,6 +2039,8 @@ def main():
                              "Smaller = denser but slower per-iter matching.")
     parser.add_argument("--matcher_dense_cert_threshold", type=float, default=0.02,
                         help="Minimum RoMa certainty to keep a dense match (default 0.02).")
+    parser.add_argument("--no_match_once_per_cycle", action="store_true",
+                        help="Disable per-cycle match precomputation (re-run matcher every iteration).")
     parser.add_argument("--matcher_min_depth_matches", type=int, default=None)
     parser.add_argument("--matcher_min_pnp_inliers", type=int, default=None)
     parser.add_argument("--matcher_ransac_reproj_thresh", type=float, default=None)
@@ -2032,6 +2318,7 @@ def main():
         matcher_dense_mode=cli.matcher_dense_mode,
         matcher_dense_stride=cli.matcher_dense_stride,
         matcher_dense_cert_threshold=cli.matcher_dense_cert_threshold,
+        match_once_per_cycle=not cli.no_match_once_per_cycle,
     )
 
     _save_run_visualizations(
