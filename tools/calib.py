@@ -1336,6 +1336,18 @@ def run_noise_inject_calib(
             max_num_keypoints=matcher_max_num_keypoints,
             ransac_reproj_thresh=matcher_ransac_reproj_thresh,
         )
+        # Warm up the dense code path to trigger all CUDA kernel JIT compilations
+        # before the training loop. Without this, the first cycle precompute is
+        # blocked for 20+ minutes on Blackwell (cc12.0 PTX JIT for new code paths).
+        if matcher_dense_mode:
+            print("[Matcher] Warming up dense inference path (one-time CUDA kernel compilation)...")
+            _dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+            try:
+                from lib.utils.rgbd_calibration import match_cross_modal_dense as _mcd
+                _mcd(matcher, _dummy, _dummy, query_stride=8, cert_threshold=0.5)
+            except Exception:
+                pass
+            print("[Matcher] Dense warm-up complete.")
         if matcher_pose_update:
             print(
                 blue(
