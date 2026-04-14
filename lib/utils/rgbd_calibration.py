@@ -622,6 +622,28 @@ def build_temporal_track_residuals(
     return temporal_residuals, num_tracks
 
 
+def sample_depth_values_vectorized(
+    depth_map: np.ndarray,
+    points: np.ndarray,
+    min_depth: float,
+    max_depth: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fast O(N) vectorized depth sampling at rounded pixel coords (no search radius).
+
+    Suitable when depth_map is dense (e.g. rendered 2DGS depth), where the
+    point coords are expected to land on valid depth pixels.
+    """
+    h, w = depth_map.shape[:2]
+    xs = np.clip(np.round(points[:, 0]).astype(np.int32), 0, w - 1)
+    ys = np.clip(np.round(points[:, 1]).astype(np.int32), 0, h - 1)
+    depths = depth_map[ys, xs].astype(np.float64)
+    _min = float(min_depth) if min_depth is not None else -np.inf
+    _max = float(max_depth) if max_depth is not None else np.inf
+    valid = np.isfinite(depths) & (depths > 0) & (depths >= _min) & (depths <= _max)
+    indices = np.where(valid)[0].astype(np.int32)
+    return indices, depths[valid]
+
+
 def sample_depth_values(
     depth_map: np.ndarray,
     points: np.ndarray,

@@ -96,6 +96,7 @@ from lib.utils.rgbd_calibration import (
     match_cross_modal_dense,
     optimize_shared_extrinsic,
     sample_depth_values,
+    sample_depth_values_vectorized,
     select_match_points,
 )
 
@@ -573,12 +574,12 @@ def _precompute_cycle_match_cache(
         if rgb_pts.shape[0] < int(matcher_min_matches):
             continue
 
-        keep_indices, _ = sample_depth_values(
+        # Use fast vectorized sampling — rendered 2DGS depth is dense, no search radius needed
+        keep_indices, _ = sample_depth_values_vectorized(
             depth_map=depth_np,
-            points=np.asarray(depth_pts, dtype=np.float64),
+            points=np.asarray(depth_pts, dtype=np.float32),
             min_depth=matcher_depth_min,
             max_depth=matcher_depth_max,
-            search_radius=2,
         )
         if keep_indices.shape[0] < int(matcher_min_depth_matches):
             continue
