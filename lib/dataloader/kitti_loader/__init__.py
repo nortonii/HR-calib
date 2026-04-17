@@ -10,6 +10,11 @@ import torch
 from lib.scene import BoundingBox, LiDARSensor
 from lib.scene.cameras import Camera
 from lib.utils.console_utils import *
+from lib.utils.kitti_utils import (
+    build_kitti_range_image_from_points,
+    interpolate_sensor2world_columns,
+)
+from lib.utils.velodyne_utils import get_kitti_hdl64e_beam_inclinations_rad
 
 # from utils.kitti_utils import LiDAR_2_Pano_KITTI
 
@@ -269,8 +274,18 @@ def load_kitti360_cameras(
     H = int(H_orig * sx)
     fx_s = float(K_raw[0, 0]) * sx
     fy_s = float(K_raw[1, 1]) * sx
+    cx_s = float(K_raw[0, 2]) * sx
+    cy_s = float(K_raw[1, 2]) * sx
     FoVx = 2.0 * math.atan(W / (2.0 * fx_s))
     FoVy = 2.0 * math.atan(H / (2.0 * fy_s))
+    K = np.array(
+        [
+            [fx_s, 0.0, cx_s],
+            [0.0, fy_s, cy_s],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
 
     cam2world_by_frame = _load_cam0_to_world(pose_file)
 
@@ -345,7 +360,7 @@ def load_kitti360_cameras(
 
             torch.save({"R": R, "T": T, "image": image_tensor}, cache_path)
 
-        cam = Camera(timestamp=frame_id, R=R, T=T, w=W, h=H, FoVx=FoVx, FoVy=FoVy)
+        cam = Camera(timestamp=frame_id, R=R, T=T, w=W, h=H, FoVx=FoVx, FoVy=FoVy, K=K)
         cameras[frame_id] = cam
         images[frame_id] = image_tensor
 
@@ -402,21 +417,22 @@ def load_kitti_raw(base_dir, args):
         torch.save(torch.tensor(world_origin, dtype=torch.float32), world_origin_path)
         print(blue(f"[KITTI-360] World origin saved: {world_origin.tolist()}"))
 
-    W, H = 1030, 66
-    inc_buttom, inc_top = math.radians(-24.9), math.radians(2.0)
-    azimuth_left, azimuth_right = np.pi, -np.pi
+    beam_inclinations_top_to_bottom = get_kitti_hdl64e_beam_inclinations_rad(
+        order="top_to_bottom"
+    )
+    beam_inclinations_bottom_to_top = get_kitti_hdl64e_beam_inclinations_rad(
+        order="bottom_to_top"
+    )
+    W, H = 1030, len(beam_inclinations_top_to_bottom)
     max_depth = 80.0
-    h_res = (azimuth_right - azimuth_left) / W
-    v_res = (inc_buttom - inc_top) / H
 
     lidar = LiDARSensor(
         sensor2ego=lidar2ego,
         name="velo",
-        inclination_bounds=(inc_buttom, inc_top),
+        inclination_bounds=beam_inclinations_bottom_to_top.tolist(),
         data_type=args.data_type,
     )
     use_column_origin = getattr(args, "lidar_origin_mode", "center") == "column_interp"
-    lidar2ego_t = torch.tensor(lidar2ego, dtype=torch.float32)
     last_ego2world = None
     if frame_ids[0] not in ego2world.keys():
         for pre_frame in range(frame_ids[0] - 1, -1, -1):
@@ -427,56 +443,46 @@ def load_kitti_raw(base_dir, args):
     for frame in frame_ids:
         prev_ego2world = last_ego2world
         xyzs, intensities = lidar_points[frame][:, :3], lidar_points[frame][:, 3]
-        dists = np.linalg.norm(xyzs, axis=1)
-
-        # Vectorized range-image construction (replaces slow per-point Python loop)
-        valid = dists <= max_depth
-        xyzs_v, ints_v, dists_v = xyzs[valid], intensities[valid], dists[valid]
-        azimuth = np.arctan2(xyzs_v[:, 1], xyzs_v[:, 0])
-        inclination = np.arctan2(xyzs_v[:, 2],
-                                  np.sqrt(xyzs_v[:, 0]**2 + xyzs_v[:, 1]**2))
-        w_idx = np.round((azimuth - azimuth_left) / h_res).astype(int)
-        h_idx = np.round((inclination - inc_top) / v_res).astype(int)
-        in_bounds = (w_idx >= 0) & (w_idx < W) & (h_idx >= 0) & (h_idx < H)
-        w_idx, h_idx = w_idx[in_bounds], h_idx[in_bounds]
-        dists_v, ints_v = dists_v[in_bounds], ints_v[in_bounds]
-
-        range_map = np.full((H, W), -1.0)
-        intensity_map = np.full((H, W), -1.0)
-        # Fill closest point per pixel (sort by distance ascending so last write wins
-        # when we use a flat-index scatter with minimum semantics)
-        order = np.argsort(dists_v)[::-1]  # farthest first → nearest overwrites
-        flat = h_idx[order] * W + w_idx[order]
-        range_map.flat[flat] = dists_v[order]
-        intensity_map.flat[flat] = ints_v[order]
-
-        range_image_r1 = np.stack([range_map, intensity_map], axis=-1)
-        range_image_r2 = np.ones_like(range_image_r1) * -1
 
         if frame in ego2world.keys():
             last_ego2world = ego2world[frame]
         current_ego2world = last_ego2world
+        if current_ego2world is None:
+            raise ValueError(f"Missing ego pose for KITTI frame {frame}")
+        current_sensor2world = current_ego2world @ lidar2ego
 
         ray_origin = None
+        sensor2world_for_rays = current_sensor2world
         if use_column_origin and current_ego2world is not None:
-            current_ego2world_t = torch.tensor(current_ego2world, dtype=torch.float32)
-            current_center = (current_ego2world_t @ lidar2ego_t)[:3, 3]
             if prev_ego2world is not None:
-                prev_ego2world_t = torch.tensor(prev_ego2world, dtype=torch.float32)
-                prev_center = (prev_ego2world_t @ lidar2ego_t)[:3, 3]
-                sweep = current_center - prev_center
-                alpha = torch.linspace(0.0, 1.0, W, dtype=torch.float32)
-                ray_origin = current_center[None, :] + alpha[:, None] * sweep[None, :]
+                prev_sensor2world = prev_ego2world @ lidar2ego
             else:
-                ray_origin = current_center[None, :].expand(W, 3)
-        range_image_r1[range_image_r1 == -1] = 0
-        range_image_r2[range_image_r2 == -1] = 0
+                prev_sensor2world = None
+            sensor2world_for_rays = interpolate_sensor2world_columns(
+                prev_sensor2world=prev_sensor2world,
+                current_sensor2world=current_sensor2world,
+                width=W,
+            )
+            ray_origin = sensor2world_for_rays[:, :3, 3]
+
+        range_map, intensity_map, ray_direction = build_kitti_range_image_from_points(
+            xyzs=xyzs,
+            intensities=intensities,
+            beam_inclinations_top_to_bottom=beam_inclinations_top_to_bottom,
+            width=W,
+            sensor2world=sensor2world_for_rays,
+            ray_origin=ray_origin,
+            max_depth=max_depth,
+        )
+        range_image_r1 = np.stack([range_map, intensity_map], axis=-1)
+        range_image_r2 = np.zeros_like(range_image_r1)
         lidar.add_frame(
             frame,
             current_ego2world,
             range_image_r1,
             range_image_r2,
             ray_origin=ray_origin,
+            ray_direction=ray_direction,
         )
 
     lidar_bbox = load_lidar_bbox(

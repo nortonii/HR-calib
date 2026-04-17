@@ -50,18 +50,43 @@ def getWorld2View2(R, t, translate=torch.tensor([.0, .0, .0]), scale=1.0):
     cam_center = C2W[:3, 3]
     translate = torch.as_tensor(translate, dtype=dtype, device=device)
     cam_center = (cam_center + translate) * scale
-    C2W[:3, 3] = cam_center
-    Rt = C2W.inverse()
+    C2W_adjusted = C2W.clone()
+    C2W_adjusted[:3, 3] = cam_center
+    Rt = C2W_adjusted.inverse()
     return Rt.float()
 
-def getProjectionMatrix(znear, zfar, fovX, fovY, device="cpu", dtype=torch.float32):
+def getProjectionMatrix(
+    znear,
+    zfar,
+    fovX,
+    fovY,
+    device="cpu",
+    dtype=torch.float32,
+    image_width=None,
+    image_height=None,
+    cx=None,
+    cy=None,
+):
     tanHalfFovY = math.tan((fovY / 2))
     tanHalfFovX = math.tan((fovX / 2))
 
-    top = tanHalfFovY * znear
-    bottom = -top
-    right = tanHalfFovX * znear
-    left = -right
+    if (
+        image_width is not None
+        and image_height is not None
+        and cx is not None
+        and cy is not None
+    ):
+        fx = float(image_width) / (2.0 * tanHalfFovX)
+        fy = float(image_height) / (2.0 * tanHalfFovY)
+        top = float(cy) * znear / fy
+        bottom = -(float(image_height) - float(cy)) * znear / fy
+        right = (float(image_width) - float(cx)) * znear / fx
+        left = -float(cx) * znear / fx
+    else:
+        top = tanHalfFovY * znear
+        bottom = -top
+        right = tanHalfFovX * znear
+        left = -right
 
     P = torch.zeros(4, 4, dtype=dtype, device=device)
 
@@ -104,14 +129,18 @@ def get_rays(K, c2w):
 def camera_to_rays(sensor):
     """Generate per-pixel ray origins and directions from a Camera object."""
     c2w = (sensor.world_view_transform.T).inverse()
-    W, H = sensor.image_width, sensor.image_height
-    ndc2pix = torch.tensor([
-        [W / 2, 0, 0, W / 2],
-        [0, H / 2, 0, H / 2],
-        [0, 0, 0, 1]], dtype=torch.float32, device='cuda').T
-    projection_matrix = c2w.T @ sensor.full_proj_transform
-    intrins = (projection_matrix @ ndc2pix)[:3, :3].T
+    if getattr(sensor, "K", None) is not None:
+        intrins = sensor.K.to(device="cuda", dtype=torch.float32)
+    else:
+        W, H = sensor.image_width, sensor.image_height
+        ndc2pix = torch.tensor([
+            [W / 2, 0, 0, W / 2],
+            [0, H / 2, 0, H / 2],
+            [0, 0, 0, 1]], dtype=torch.float32, device='cuda').T
+        projection_matrix = c2w.T @ sensor.full_proj_transform
+        intrins = (projection_matrix @ ndc2pix)[:3, :3].T
 
+    W, H = sensor.image_width, sensor.image_height
     grid_x, grid_y = torch.meshgrid(
         torch.arange(W, device='cuda').float(),
         torch.arange(H, device='cuda').float(),
@@ -124,14 +153,18 @@ def camera_to_rays(sensor):
 
 def image2point(depthmap, sensor):
     c2w = (sensor.world_view_transform.T).inverse()
-    W, H = sensor.image_width, sensor.image_height
-    ndc2pix = torch.tensor([
-        [W / 2, 0, 0, (W) / 2],
-        [0, H / 2, 0, (H) / 2],
-        [0, 0, 0, 1]]).float().cuda().T
-    projection_matrix = c2w.T @ sensor.full_proj_transform
-    intrins = (projection_matrix @ ndc2pix)[:3,:3].T
+    if getattr(sensor, "K", None) is not None:
+        intrins = sensor.K.to(device="cuda", dtype=torch.float32)
+    else:
+        W, H = sensor.image_width, sensor.image_height
+        ndc2pix = torch.tensor([
+            [W / 2, 0, 0, (W) / 2],
+            [0, H / 2, 0, (H) / 2],
+            [0, 0, 0, 1]]).float().cuda().T
+        projection_matrix = c2w.T @ sensor.full_proj_transform
+        intrins = (projection_matrix @ ndc2pix)[:3,:3].T
 
+    W, H = sensor.image_width, sensor.image_height
     grid_x, grid_y = torch.meshgrid(torch.arange(W, device='cuda').float(), torch.arange(H, device='cuda').float(), indexing='xy')
     points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(-1, 3)
     rays_d = points @ intrins.inverse().T @ c2w[:3,:3].T

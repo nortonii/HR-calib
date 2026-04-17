@@ -497,6 +497,7 @@ class CameraPoseCorrection(nn.Module):
             trans=trans,
             scale=camera.scale,
             data_device=device,
+            K=_move_tensor(getattr(camera, "K", None)),
         )
 
     def regularization_loss(self, frame_id: int, config=None):

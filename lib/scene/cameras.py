@@ -15,7 +15,8 @@ from lib.utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
 class Camera:
     def __init__(self, timestamp, R, T, w, h, FoVx, FoVy, depth=None, intensity=None,
-                 trans=torch.tensor([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
+                 trans=torch.tensor([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
+                 K=None
                 ):
         if isinstance(R, torch.Tensor):
             device = R.device
@@ -36,6 +37,7 @@ class Camera:
         self.intensity_map = intensity
         self.image_width = w
         self.image_height = h
+        self.K = None if K is None else torch.as_tensor(K, dtype=dtype, device=device)
 
         self.zfar = 100.0
         self.znear = 0.01
@@ -51,6 +53,10 @@ class Camera:
             fovY=self.FoVy,
             device=device,
             dtype=dtype,
+            image_width=self.image_width if self.K is not None else None,
+            image_height=self.image_height if self.K is not None else None,
+            cx=None if self.K is None else float(self.K[0, 2]),
+            cy=None if self.K is None else float(self.K[1, 2]),
         ).transpose(0,1)
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]

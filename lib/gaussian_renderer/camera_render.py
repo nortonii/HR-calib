@@ -21,6 +21,7 @@ except ImportError:
     SurfelRasterizer = None
 
 from lib.gaussian_renderer import raytracing
+from lib.gaussian_renderer.threedgrut_backend import render_camera_with_3dgut
 from lib.scene.cameras import Camera
 from lib.utils.general_utils import matrix_to_quaternion, quaternion_raw_multiply
 from lib.utils.graphics_utils import geom_transform_points
@@ -50,13 +51,30 @@ def _make_camera_like(source_camera, rotation=None, translation=None, device="cu
         trans=_move_tensor(source_camera.trans),
         scale=source_camera.scale,
         data_device=str(target_device),
+        K=_move_tensor(getattr(source_camera, "K", None)),
     )
 
 
+def _get_training_render_mode(args) -> str | None:
+    model = getattr(args, "model", None)
+    mode = getattr(model, "training_render_mode", None)
+    if mode is None:
+        return None
+    return str(mode).lower()
+
+
 def get_camera_render_backend(args, require_rgb=False):
+    training_mode = _get_training_render_mode(args)
+    if training_mode in {"hybrid_3dgrut", "hybrid-3dgrut", "3dgrut_hybrid"}:
+        return "3dgut_rasterization"
     backend = str(getattr(getattr(args, "model", None), "camera_render_backend", "rasterization")).lower()
     backend_aliases = {
         "3dgs": "rasterization",
+        "3dgut": "3dgut_rasterization",
+        "3dgrut": "3dgut_rasterization",
+        "gut": "3dgut_rasterization",
+        "gut_rasterization": "3dgut_rasterization",
+        "3dgut_raster": "3dgut_rasterization",
         "raster": "rasterization",
         "rasterizer": "rasterization",
         "2dgs": "surfel_rasterization",
@@ -67,10 +85,10 @@ def get_camera_render_backend(args, require_rgb=False):
         "raytrace": "raytracing",
     }
     backend = backend_aliases.get(backend, backend)
-    if backend not in {"rasterization", "surfel_rasterization", "raytracing"}:
+    if backend not in {"rasterization", "surfel_rasterization", "raytracing", "3dgut_rasterization"}:
         raise ValueError(
             f"Unsupported model.camera_render_backend '{backend}'. "
-            "Expected 'rasterization', 'surfel_rasterization', or 'raytracing'."
+            "Expected 'rasterization', 'surfel_rasterization', '3dgut_rasterization', or 'raytracing'."
         )
     return backend
 
@@ -127,15 +145,13 @@ def render_camera_3dgs(camera, gaussian_assets, args, scaling_modifier=1.0,
     all_means3D, all_dc, all_sh, all_opacities, all_scales = [], [], [], [], []
     obj_rot, rot_in_local = [], []
 
-    use_dual_opacity = getattr(args, "camera_dual_opacity", True)
-
     for pc in gaussian_assets:
         means3D = pc.get_world_xyz(frame)
         features = pc.get_camera_features  # (N, D, 3): camera-only RGB SH branch
         all_means3D.append(means3D)
         all_dc.append(features[:, :1, :])      # (N, 1, 3) – DC component
         all_sh.append(features[:, 1:, :])      # (N, D-1, 3) – higher orders
-        all_opacities.append(pc.get_opacity_cam if use_dual_opacity else pc.get_opacity)
+        all_opacities.append(pc.get_opacity)
         all_scales.append(pc.get_scaling)
         r1, r2 = pc.get_rotation(frame)
         obj_rot.append(r1.expand(r2.shape[0], -1))
@@ -253,13 +269,11 @@ def render_camera_2dgs(camera, gaussian_assets, args, scaling_modifier=1.0,
     all_means3D, all_features, all_opacities, all_scales = [], [], [], []
     obj_rot, rot_in_local = [], []
 
-    use_dual_opacity = getattr(args, "camera_dual_opacity", True)
-
     for pc in gaussian_assets:
         means3D = pc.get_world_xyz(frame)
         all_means3D.append(means3D)
         all_features.append(pc.get_camera_features)
-        all_opacities.append(pc.get_opacity_cam if use_dual_opacity else pc.get_opacity)
+        all_opacities.append(pc.get_opacity)
         all_scales.append(pc.get_scaling)
         r1, r2 = pc.get_rotation(frame)
         obj_rot.append(r1.expand(r2.shape[0], -1))
@@ -349,6 +363,32 @@ def render_camera_2dgs(camera, gaussian_assets, args, scaling_modifier=1.0,
     }
 
 
+def render_camera_3dgut(camera, gaussian_assets, args, scaling_modifier=1.0,
+                        cam_rotation=None, cam_translation=None):
+    if scaling_modifier != 1.0:
+        raise NotImplementedError("3DGUT backend does not support scaling_modifier overrides yet.")
+
+    if cam_rotation is not None and cam_translation is not None:
+        target_camera = _make_camera_like(
+            camera,
+            rotation=torch.eye(3, dtype=torch.float32, device="cuda"),
+            translation=torch.zeros(3, dtype=torch.float32, device="cuda"),
+            device="cuda",
+        )
+    else:
+        target_camera = _make_camera_like(camera, device="cuda")
+
+    result = render_camera_with_3dgut(
+        target_camera,
+        gaussian_assets,
+        args,
+        gaussian_transform_rotation=cam_rotation,
+        gaussian_transform_translation=cam_translation,
+    )
+    result["render_backend"] = "3dgut_rasterization"
+    return result
+
+
 def render_camera_raytracing(camera, gaussian_assets, args, scaling_modifier=1.0,
                              cam_rotation=None, cam_translation=None, require_rgb=False):
     if cam_rotation is not None and cam_translation is not None:
@@ -404,6 +444,15 @@ def render_camera(camera, gaussian_assets, args, scaling_modifier=1.0,
             cam_rotation=cam_rotation,
             cam_translation=cam_translation,
             require_rgb=require_rgb,
+        )
+    if backend == "3dgut_rasterization":
+        return render_camera_3dgut(
+            camera,
+            gaussian_assets,
+            args,
+            scaling_modifier=scaling_modifier,
+            cam_rotation=cam_rotation,
+            cam_translation=cam_translation,
         )
     if backend == "surfel_rasterization":
         return render_camera_2dgs(

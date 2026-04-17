@@ -15,6 +15,11 @@ import torch
 from lib.scene import LiDARSensor
 from lib.scene.cameras import Camera
 from lib.utils.console_utils import *
+from lib.utils.kitti_utils import (
+    build_kitti_range_image_from_points,
+    interpolate_sensor2world_columns,
+)
+from lib.utils.velodyne_utils import get_kitti_hdl64e_beam_inclinations_rad
 
 
 def _read_ply_binary(ply_path):
@@ -34,40 +39,6 @@ def _read_ply_binary(ply_path):
     else:
         data = data.reshape(-1, 4)
     return data  # (N, 4): x y z intensity
-
-
-def _build_range_image(xyzs, intensities, H, W, inc_top, v_res, azimuth_left, h_res, max_depth):
-    """Vectorized range image construction."""
-    dists = np.linalg.norm(xyzs, axis=1)
-    valid = (dists >= 0.1) & (dists <= max_depth)
-    xyzs = xyzs[valid]
-    intensities = intensities[valid]
-    dists = dists[valid]
-
-    x, y, z = xyzs[:, 0], xyzs[:, 1], xyzs[:, 2]
-    azimuth = np.arctan2(y, x)
-    inclination = np.arctan2(z, np.sqrt(x**2 + y**2))
-
-    w_idx = np.round((azimuth - azimuth_left) / h_res).astype(int)
-    h_idx = np.round((inclination - inc_top) / v_res).astype(int)
-
-    in_bounds = (w_idx >= 0) & (w_idx < W) & (h_idx >= 0) & (h_idx < H)
-    w_idx = w_idx[in_bounds]
-    h_idx = h_idx[in_bounds]
-    dists = dists[in_bounds]
-    intensities = intensities[in_bounds]
-
-    range_map = np.zeros((H, W), dtype=np.float32)
-    intensity_map = np.zeros((H, W), dtype=np.float32)
-
-    # Assign farthest-first so closest points overwrite last (correct for both range and intensity)
-    order = np.argsort(-dists)
-    h_ord = h_idx[order]
-    w_ord = w_idx[order]
-    range_map[h_ord, w_ord] = dists[order]
-    intensity_map[h_ord, w_ord] = intensities[order]
-
-    return range_map, intensity_map
 
 
 def _parse_kitti_calib_file(calib_path: str):
@@ -127,9 +98,11 @@ def load_kitti_calib_cameras(
     # LiDAR poses: frame_i → LiDAR world (4×4)
     lidar_poses = np.loadtxt(pose_file).reshape(-1, 4, 4)
 
-    # Intrinsics from P0 (same focal lengths as camera images, cx/cy for FoV)
+    # Intrinsics from P0
     fx_orig = float(P0[0, 0])
     fy_orig = float(P0[1, 1])
+    cx_orig = float(P0[0, 2])
+    cy_orig = float(P0[1, 2])
 
     # Actual image dimensions from first frame on disk
     first_img_path = os.path.join(scene_dir, f"{frame_ids[0]:02d}.png")
@@ -142,8 +115,17 @@ def load_kitti_calib_cameras(
     W = int(W_orig * sx)
     H = int(H_orig * sx)
     fx_s, fy_s = fx_orig * sx, fy_orig * sx
+    cx_s, cy_s = cx_orig * sx, cy_orig * sx
     FoVx = 2.0 * math.atan(W / (2.0 * fx_s))
     FoVy = 2.0 * math.atan(H / (2.0 * fy_s))
+    K = np.array(
+        [
+            [fx_s, 0.0, cx_s],
+            [0.0, fy_s, cy_s],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
 
     # Cache: invalidate if dimensions or extrinsic method changed
     cache_dir = os.path.join(base_dir, f"cache_cam_{scene_name}_s{scale}")
@@ -202,7 +184,7 @@ def load_kitti_calib_cameras(
 
             torch.save({"R": R, "T": T, "image": image_tensor}, cache_path)
 
-        cam = Camera(timestamp=frame_id, R=R, T=T, w=W, h=H, FoVx=FoVx, FoVy=FoVy)
+        cam = Camera(timestamp=frame_id, R=R, T=T, w=W, h=H, FoVx=FoVx, FoVy=FoVy, K=K)
         cameras[frame_id] = cam
         images[frame_id] = image_tensor
 
@@ -227,21 +209,22 @@ def load_kitti_calib_raw(base_dir, args):
     frame_ids = [i for i in range(frames[0], frames[1] + 1) if i < num_poses]
     print(blue(f"[kitti-calib {scene_name}] Using {len(frame_ids)} frames in [{frames[0]}, {frames[1]}]"))
 
-    # HDL-64E parameters (same as KITTI-360)
-    W, H = 1030, 66
-    inc_top = math.radians(2.0)
-    inc_bottom = math.radians(-24.9)
-    azimuth_left = np.pi
+    # HDL-64E parameters (same nominal vertical layout as KITTI-360).
+    beam_inclinations_top_to_bottom = get_kitti_hdl64e_beam_inclinations_rad(
+        order="top_to_bottom"
+    )
+    beam_inclinations_bottom_to_top = get_kitti_hdl64e_beam_inclinations_rad(
+        order="bottom_to_top"
+    )
+    W, H = 1030, len(beam_inclinations_top_to_bottom)
     max_depth = 80.0
-    h_res = (-np.pi - np.pi) / W   # (azimuth_right - azimuth_left) / W = (-pi - pi)/W
-    v_res = (inc_bottom - inc_top) / H
 
     sensor2ego = np.eye(4, dtype=np.float64)
 
     lidar = LiDARSensor(
         sensor2ego=sensor2ego,
         name="velo",
-        inclination_bounds=(inc_bottom, inc_top),
+        inclination_bounds=beam_inclinations_bottom_to_top.tolist(),
         data_type=args.data_type,
     )
 
@@ -255,24 +238,29 @@ def load_kitti_calib_raw(base_dir, args):
         xyzs = pts[:, :3]
         intensities = pts[:, 3]
 
-        range_map, intensity_map = _build_range_image(
-            xyzs, intensities, H, W, inc_top, v_res, azimuth_left, h_res, max_depth
+        ray_origin = None
+        sensor2world_for_rays = ego2world
+        if use_column_origin:
+            sensor2world_for_rays = interpolate_sensor2world_columns(
+                prev_sensor2world=prev_ego2world,
+                current_sensor2world=ego2world,
+                width=W,
+            )
+            ray_origin = sensor2world_for_rays[:, :3, 3]
+        prev_ego2world = ego2world
+
+        range_map, intensity_map, ray_direction = build_kitti_range_image_from_points(
+            xyzs=xyzs,
+            intensities=intensities,
+            beam_inclinations_top_to_bottom=beam_inclinations_top_to_bottom,
+            width=W,
+            sensor2world=sensor2world_for_rays,
+            ray_origin=ray_origin,
+            max_depth=max_depth,
         )
 
         range_image_r1 = np.stack([range_map, intensity_map], axis=-1)
         range_image_r2 = np.zeros_like(range_image_r1)
-
-        ray_origin = None
-        if use_column_origin:
-            current_center = torch.tensor(ego2world[:3, 3], dtype=torch.float32)
-            if prev_ego2world is not None:
-                prev_center = torch.tensor(prev_ego2world[:3, 3], dtype=torch.float32)
-                sweep = current_center - prev_center
-                alpha = torch.linspace(0.0, 1.0, W, dtype=torch.float32)
-                ray_origin = current_center[None, :] + alpha[:, None] * sweep[None, :]
-            else:
-                ray_origin = current_center[None, :].expand(W, 3)
-        prev_ego2world = ego2world
 
         lidar.add_frame(
             frame,
@@ -280,7 +268,7 @@ def load_kitti_calib_raw(base_dir, args):
             range_image_r1,
             range_image_r2,
             ray_origin=ray_origin,
+            ray_direction=ray_direction,
         )
 
     return lidar, {}  # no bounding boxes
-

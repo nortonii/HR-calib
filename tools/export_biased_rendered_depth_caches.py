@@ -66,6 +66,7 @@ def _camera_from_l2c(
         h=reference_camera.image_height,
         FoVx=reference_camera.FoVx,
         FoVy=reference_camera.FoVy,
+        K=getattr(reference_camera, "K", None),
     )
 
 

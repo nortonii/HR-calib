@@ -79,6 +79,7 @@ def _camera_from_rgb_camera(frame_id: int, reference_camera: Camera, T_rgb_d: np
         h=reference_camera.image_height,
         FoVx=reference_camera.FoVx,
         FoVy=reference_camera.FoVy,
+        K=getattr(reference_camera, "K", None),
     )
 
 

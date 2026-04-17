@@ -12,6 +12,7 @@ from tqdm import tqdm
 tf.config.set_visible_devices([], "GPU")
 
 from lib.dataloader.waymo_loader.waymo_protobuf import dataset_pb2
+from lib.dataloader.waymo_loader.waymo_protobuf import label_pb2
 from lib.scene.bounding_box import BoundingBox
 from lib.scene.cameras import Camera
 from lib.scene.lidar_sensor import LiDARSensor
@@ -36,6 +37,158 @@ def decompress_range_image(compressed):
         decompress_data.data, dtype=torch.float32
     ).reshape(tuple(decompress_data.shape.dims))
     return range_image_tensor
+
+
+def decompress_matrix_int32(compressed):
+    decompress_str = tf.io.decode_compressed(compressed, "ZLIB")
+    decompress_data = dataset_pb2.MatrixInt32()
+    decompress_data.ParseFromString(bytearray(decompress_str.numpy()))
+    matrix_tensor = torch.tensor(decompress_data.data, dtype=torch.int32).reshape(
+        tuple(decompress_data.shape.dims)
+    )
+    return matrix_tensor
+
+
+_WAYMO_DYNAMIC_LABEL_TYPES = {
+    label_pb2.Label.TYPE_VEHICLE,
+    label_pb2.Label.TYPE_PEDESTRIAN,
+    label_pb2.Label.TYPE_CYCLIST,
+}
+_WAYMO_CAMERA_SUFFIXES = (
+    "_FRONT",
+    "_FRONT_LEFT",
+    "_FRONT_RIGHT",
+    "_SIDE_LEFT",
+    "_SIDE_RIGHT",
+    "_REAR_LEFT",
+    "_REAR",
+    "_REAR_RIGHT",
+)
+
+
+def _normalize_waymo_label_id(label_id: str) -> str:
+    if not label_id:
+        return ""
+    for suffix in _WAYMO_CAMERA_SUFFIXES:
+        if label_id.endswith(suffix):
+            return label_id[: -len(suffix)]
+    return label_id
+
+
+def _collect_waymo_dynamic_label_ids(frame_data, speed_threshold_mps: float = 0.5):
+    dynamic_ids = set()
+    dynamic_boxes = []
+    for label in frame_data.laser_labels:
+        if int(label.type) not in _WAYMO_DYNAMIC_LABEL_TYPES:
+            continue
+        speed = math.sqrt(
+            float(label.metadata.speed_x) ** 2
+            + float(label.metadata.speed_y) ** 2
+            + float(label.metadata.speed_z) ** 2
+        )
+        if speed <= float(speed_threshold_mps):
+            continue
+        dynamic_ids.add(str(label.id))
+        box = label.box
+        dynamic_boxes.append(
+            {
+                "center": np.array(
+                    [box.center_x, box.center_y, box.center_z], dtype=np.float32
+                ),
+                "size": np.array([box.length, box.width, box.height], dtype=np.float32),
+                "yaw": float(box.heading),
+            }
+        )
+    return dynamic_ids, dynamic_boxes
+
+
+def _add_waymo_box_to_mask(mask: np.ndarray, box, scale: int = 1, pad_px: int = 4):
+    if mask.size == 0:
+        return
+    width = mask.shape[1]
+    height = mask.shape[0]
+    cx = float(box.center_x) / float(scale)
+    cy = float(box.center_y) / float(scale)
+    bw = float(box.length) / float(scale)
+    bh = float(box.width) / float(scale)
+    half_w = 0.5 * bw
+    half_h = 0.5 * bh
+    x0 = max(int(math.floor(cx - half_w)) - int(pad_px), 0)
+    x1 = min(int(math.ceil(cx + half_w)) + int(pad_px), width)
+    y0 = max(int(math.floor(cy - half_h)) - int(pad_px), 0)
+    y1 = min(int(math.ceil(cy + half_h)) + int(pad_px), height)
+    if x1 > x0 and y1 > y0:
+        mask[y0:y1, x0:x1] = True
+
+
+def _build_waymo_camera_supervision_mask(
+    frame_data,
+    camera_id: int,
+    width: int,
+    height: int,
+    scale: int,
+    dynamic_ids: set[str],
+):
+    mask = np.zeros((height, width), dtype=bool)
+    for label_set in frame_data.projected_lidar_labels:
+        if int(label_set.name) != int(camera_id):
+            continue
+        for label in label_set.labels:
+            if _normalize_waymo_label_id(str(label.id)) in dynamic_ids:
+                _add_waymo_box_to_mask(mask, label.box, scale=scale)
+    for label_set in frame_data.camera_labels:
+        if int(label_set.name) != int(camera_id):
+            continue
+        for label in label_set.labels:
+            if _normalize_waymo_label_id(str(label.id)) in dynamic_ids:
+                _add_waymo_box_to_mask(mask, label.box, scale=scale)
+    return torch.from_numpy(mask)
+
+
+def _build_waymo_range_dynamic_mask(
+    lidar: LiDARSensor,
+    frame: int,
+    range_image: torch.Tensor,
+    ego2world: torch.Tensor,
+    dynamic_boxes: list[dict],
+    box_pad_m: float = 0.15,
+):
+    if range_image is None:
+        return None
+    mask = torch.zeros(range_image.shape[:2], dtype=torch.bool)
+    if not dynamic_boxes:
+        return mask
+
+    points_world = lidar.range2point(frame, range_image[..., 0]).detach().cpu()
+    ego_rot = ego2world[:3, :3].float().cpu()
+    ego_trans = ego2world[:3, 3].float().cpu()
+    points_ego = (points_world - ego_trans.view(1, 1, 3)) @ ego_rot
+    valid = range_image[..., 0] > 1.0e-3
+    if not torch.any(valid):
+        return mask
+
+    mask = valid.clone()
+    mask.zero_()
+    for box in dynamic_boxes:
+        center = torch.from_numpy(box["center"]).float()
+        size = torch.from_numpy(box["size"]).float() + float(box_pad_m) * 2.0
+        yaw = float(box["yaw"])
+        rot = torch.tensor(
+            [
+                [math.cos(yaw), -math.sin(yaw), 0.0],
+                [math.sin(yaw), math.cos(yaw), 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+        local = (points_ego - center.view(1, 1, 3)) @ rot
+        inside = (
+            (local[..., 0].abs() <= size[0] * 0.5)
+            & (local[..., 1].abs() <= size[1] * 0.5)
+            & (local[..., 2].abs() <= size[2] * 0.5)
+        )
+        mask |= inside & valid
+    return mask
 
 
 def load_waymo_raw(base_dir, args):
@@ -103,10 +256,15 @@ def load_waymo_raw(base_dir, args):
             ego2world = ego2world.clone()
             ego2world[:3, 3] -= world_origin
 
+            dynamic_ids, dynamic_boxes = _collect_waymo_dynamic_label_ids(frame_data)
+
             decompressed_dir = f"{base_dir}/cache"
             os.makedirs(decompressed_dir, exist_ok=True)
             decompressed_path = os.path.join(
                 decompressed_dir, f"decompressed_frame_{frame}_sensor_{name}.pt"
+            )
+            dynamic_mask_path = os.path.join(
+                decompressed_dir, f"dynamic_mask_frame_{frame}_sensor_{name}.pt"
             )
             if os.path.exists(decompressed_path):
                 range_image_r1, range_image_r2 = torch.load(decompressed_path)
@@ -128,6 +286,25 @@ def load_waymo_raw(base_dir, args):
             lidar.add_frame(
                 frame=frame, ego2world=ego2world, r1=range_image_r1, r2=range_image_r2
             )
+            if os.path.exists(dynamic_mask_path):
+                dynamic_mask_r1, dynamic_mask_r2 = torch.load(dynamic_mask_path)
+            else:
+                dynamic_mask_r1 = _build_waymo_range_dynamic_mask(
+                    lidar=lidar,
+                    frame=frame,
+                    range_image=range_image_r1,
+                    ego2world=ego2world,
+                    dynamic_boxes=dynamic_boxes,
+                )
+                dynamic_mask_r2 = _build_waymo_range_dynamic_mask(
+                    lidar=lidar,
+                    frame=frame,
+                    range_image=range_image_r2,
+                    ego2world=ego2world,
+                    dynamic_boxes=dynamic_boxes,
+                )
+                torch.save((dynamic_mask_r1, dynamic_mask_r2), dynamic_mask_path)
+            lidar.set_dynamic_mask(frame, return1=dynamic_mask_r1, return2=dynamic_mask_r2)
 
         for labels in frame_data.laser_labels:
             box = labels.box
@@ -203,10 +380,22 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
     sx = 1.0 / scale
     W = int(W_orig * sx)
     H = int(H_orig * sx)
-    FoVx = 2.0 * math.atan(W / (2.0 * fx * sx))
-    FoVy = 2.0 * math.atan(H / (2.0 * fy * sx))
+    fx_s = float(fx) * sx
+    fy_s = float(fy) * sx
+    cx_s = float(cx) * sx
+    cy_s = float(cy) * sx
+    FoVx = 2.0 * math.atan(W / (2.0 * fx_s))
+    FoVy = 2.0 * math.atan(H / (2.0 * fy_s))
+    K = np.array(
+        [
+            [fx_s, 0.0, cx_s],
+            [0.0, fy_s, cy_s],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
 
-    cam_cache_dir = os.path.join(base_dir, f"cache_cam{camera_id}_s{scale}_v2")
+    cam_cache_dir = os.path.join(base_dir, f"cache_cam{camera_id}_s{scale}_v3")
     os.makedirs(cam_cache_dir, exist_ok=True)
 
     cameras: Dict[int, Camera] = {}
@@ -242,10 +431,13 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
         if os.path.exists(cache_path):
             cached = torch.load(cache_path)
             R, T, image_tensor = cached["R"], cached["T"], cached["image"]
+            supervision_mask = cached.get("supervision_mask")
         else:
             record = dataset[frame]
             frame_data = dataset_pb2.Frame()
             frame_data.ParseFromString(bytearray(record.numpy()))
+
+            dynamic_ids, _dynamic_boxes = _collect_waymo_dynamic_label_ids(frame_data)
 
             ego2world = torch.tensor(
                 list(frame_data.pose.transform), dtype=torch.float32
@@ -271,16 +463,31 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
                     break
             if img_bytes is None:
                 continue
-            nparr = np.frombuffer(img_bytes, np.uint8)
-            img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            img_rgb = tf.io.decode_jpeg(img_bytes, channels=3).numpy()
             if scale != 1:
                 img_rgb = cv2.resize(img_rgb, (W, H), interpolation=cv2.INTER_AREA)
             image_tensor = torch.from_numpy(img_rgb).float() / 255.0  # (H, W, 3)
+            supervision_mask = _build_waymo_camera_supervision_mask(
+                frame_data=frame_data,
+                camera_id=int(camera_id),
+                width=W,
+                height=H,
+                scale=int(scale),
+                dynamic_ids=dynamic_ids,
+            )
 
-            torch.save({"R": R, "T": T, "image": image_tensor}, cache_path)
+            torch.save(
+                {
+                    "R": R,
+                    "T": T,
+                    "image": image_tensor,
+                    "supervision_mask": supervision_mask,
+                },
+                cache_path,
+            )
 
-        cam = Camera(timestamp=frame, R=R, T=T, w=W, h=H, FoVx=FoVx, FoVy=FoVy)
+        cam = Camera(timestamp=frame, R=R, T=T, w=W, h=H, FoVx=FoVx, FoVy=FoVy, K=K)
+        cam.supervision_mask = supervision_mask.bool() if supervision_mask is not None else None
         cameras[frame] = cam
         images[frame] = image_tensor  # (H, W, 3) float32 in [0, 1]
 

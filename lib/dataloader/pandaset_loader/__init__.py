@@ -640,8 +640,20 @@ def load_pandaset_cameras(
     sx = 1.0 / scale
     W = int(W_orig * sx)
     H = int(H_orig * sx)
-    FoVx = 2.0 * math.atan(W / (2.0 * fx_orig * sx))
-    FoVy = 2.0 * math.atan(H / (2.0 * fy_orig * sx))
+    fx_s = fx_orig * sx
+    fy_s = fy_orig * sx
+    cx_s = cx_orig * sx
+    cy_s = cy_orig * sx
+    FoVx = 2.0 * math.atan(W / (2.0 * fx_s))
+    FoVy = 2.0 * math.atan(H / (2.0 * fy_s))
+    K = np.array(
+        [
+            [fx_s, 0.0, cx_s],
+            [0.0, fy_s, cy_s],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
 
     # Camera poses (cam2world in PandaSet's world frame = LiDAR world frame)
     pose_list = _load_pandaset_poses(cam_dir)
@@ -683,7 +695,7 @@ def load_pandaset_cameras(
 
             torch.save({"R": R, "T": T, "image": image_tensor}, cache_path)
 
-        cam = Camera(timestamp=frame_id, R=R, T=T, w=W, h=H, FoVx=FoVx, FoVy=FoVy)
+        cam = Camera(timestamp=frame_id, R=R, T=T, w=W, h=H, FoVx=FoVx, FoVy=FoVy, K=K)
         cameras[frame_id] = cam
         images[frame_id] = image_tensor
 
