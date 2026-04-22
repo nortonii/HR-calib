@@ -13,6 +13,7 @@ from lib.utils.console_utils import *
 from lib.utils.kitti_utils import (
     build_kitti_range_image_from_points,
     interpolate_sensor2world_columns,
+    resolve_kitti_lidar_width,
 )
 from lib.utils.velodyne_utils import get_kitti_hdl64e_beam_inclinations_rad
 
@@ -177,31 +178,38 @@ def load_SfM_clouds(SfM_clouds_dir):
         return None
 
 
-def _parse_perspective_txt(calib_file: str):
-    """Parse perspective.txt for KITTI-360 camera 0.
+def _parse_perspective_txt(calib_file: str, camera_name: str = "image_00"):
+    """Parse perspective.txt for KITTI-360 perspective camera 0/1.
 
     Returns:
         K_raw:   (3,3) float64 – raw camera intrinsic matrix
         D:       (5,)  float64 – distortion coefficients [k1, k2, p1, p2, k3]
-        K_rect:  (3,3) float64 – rectified camera intrinsic matrix (from P_rect_00)
-        W_rect:  int – rectified image width  (from S_rect_00)
-        H_rect:  int – rectified image height (from S_rect_00)
+        K_rect:  (3,3) float64 – rectified camera intrinsic matrix (from P_rect_XX)
+        W_rect:  int – rectified image width  (from S_rect_XX)
+        H_rect:  int – rectified image height (from S_rect_XX)
     """
+    if camera_name not in {"image_00", "image_01"}:
+        raise ValueError(f"Unsupported KITTI-360 perspective camera: {camera_name}")
+    cam_suffix = camera_name.split("_")[-1]
+    k_key = f"K_{cam_suffix}:"
+    d_key = f"D_{cam_suffix}:"
+    p_key = f"P_rect_{cam_suffix}:"
+    s_key = f"S_rect_{cam_suffix}:"
     K_raw = D = K_rect = W_rect = H_rect = None
     with open(calib_file, "r") as f:
         for line in f:
             line = line.strip()
-            if line.startswith("K_00:"):
+            if line.startswith(k_key):
                 vals = [float(x) for x in line.split(":")[1].split()]
                 K_raw = np.array(vals).reshape(3, 3)
                 K_raw[2, 2] = 1.0  # KITTI-360 perspective.txt omits the last 1
-            elif line.startswith("D_00:"):
+            elif line.startswith(d_key):
                 D = np.array([float(x) for x in line.split(":")[1].split()])
-            elif line.startswith("P_rect_00:"):
+            elif line.startswith(p_key):
                 vals = [float(x) for x in line.split(":")[1].split()]
                 P_rect = np.array(vals).reshape(3, 4)
                 K_rect = P_rect[:3, :3]
-            elif line.startswith("S_rect_00:"):
+            elif line.startswith(s_key):
                 vals = [float(x) for x in line.split(":")[1].split()]
                 W_rect, H_rect = int(vals[0]), int(vals[1])
     if any(x is None for x in [K_raw, D, K_rect, W_rect, H_rect]):
@@ -229,6 +237,24 @@ def _load_cam0_to_world(pose_file: str) -> Dict[int, np.ndarray]:
     return result
 
 
+def _load_kitti360_cam_to_pose(calib_file: str) -> Dict[str, np.ndarray]:
+    """Parse calib_cam_to_pose.txt → dict {'image_00': (4,4), ...}."""
+    result: Dict[str, np.ndarray] = {}
+    with open(calib_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            name, values = line.split(":", 1)
+            vals = [float(x) for x in values.split()]
+            if len(vals) != 12:
+                continue
+            mat = np.eye(4, dtype=np.float64)
+            mat[:3, :] = np.array(vals, dtype=np.float64).reshape(3, 4)
+            result[name.strip()] = mat
+    return result
+
+
 def load_kitti360_cameras(
     base_dir: str,
     args,
@@ -236,7 +262,7 @@ def load_kitti360_cameras(
     frame_ids,
     scale: int = 4,
 ) -> Tuple[Dict[int, Camera], Dict[int, torch.Tensor]]:
-    """Load KITTI-360 perspective camera (image_00) for training supervision.
+    """Load KITTI-360 perspective camera (image_00 or image_01) for training supervision.
 
     Raw images have radial distortion (k1≈-0.344). Following HiGS-Calib-360,
     we undistort with cv2.undistort(img, K_raw, D) keeping K_raw as the output
@@ -247,15 +273,19 @@ def load_kitti360_cameras(
         images:  dict {frame_id: Tensor (H, W, 3) float32 in [0, 1]}
     """
     calib_file = os.path.join(base_dir, "calibration", "perspective.txt")
-    pose_file = os.path.join(base_dir, "data_poses", str(seq_num), "cam0_to_world.txt")
-    img_dir = os.path.join(base_dir, "data_2d_raw", str(seq_num), "image_00", "data_rgb")
+    camera_name = str(getattr(args, "kitti360_camera", "image_00"))
+    pose_file = os.path.join(base_dir, "data_poses", str(seq_num), "poses.txt")
+    cam_to_pose_file = os.path.join(base_dir, "calibration", "calib_cam_to_pose.txt")
+    img_dir = os.path.join(base_dir, "data_2d_raw", str(seq_num), camera_name, "data_rgb")
 
     if not os.path.exists(pose_file):
-        raise FileNotFoundError(f"cam0_to_world.txt not found: {pose_file}")
+        raise FileNotFoundError(f"poses.txt not found: {pose_file}")
+    if not os.path.exists(cam_to_pose_file):
+        raise FileNotFoundError(f"calib_cam_to_pose.txt not found: {cam_to_pose_file}")
     if not os.path.exists(img_dir):
         raise FileNotFoundError(f"Camera image dir not found: {img_dir}")
 
-    K_raw, D, K_rect, W_rect, H_rect = _parse_perspective_txt(calib_file)
+    K_raw, D, K_rect, W_rect, H_rect = _parse_perspective_txt(calib_file, camera_name=camera_name)
 
     # Use K_raw intrinsics and raw image dimensions (1392×512).
     # cv2.undistort with K_raw keeps the same size and FoV — matches HiGS-Calib-360.
@@ -287,7 +317,11 @@ def load_kitti360_cameras(
         dtype=np.float32,
     )
 
-    cam2world_by_frame = _load_cam0_to_world(pose_file)
+    pose2world_by_frame = load_ego2world(pose_file)
+    cam_to_pose_by_name = _load_kitti360_cam_to_pose(cam_to_pose_file)
+    if camera_name not in cam_to_pose_by_name:
+        raise KeyError(f"{camera_name} not found in {cam_to_pose_file}")
+    cam_to_pose = cam_to_pose_by_name[camera_name]
 
     # World-centering: subtract the same ego world origin used by load_kitti_raw
     # so camera poses are in the same centered coordinate frame as the LiDAR.
@@ -295,16 +329,16 @@ def load_kitti360_cameras(
     if os.path.exists(world_origin_path):
         world_origin = torch.load(world_origin_path, weights_only=True).numpy()
     else:
-        # Fallback: use first available cam2world translation
-        available = sorted(cam2world_by_frame.keys())
-        world_origin = cam2world_by_frame[available[0]][:3, 3].copy()
-    for f in cam2world_by_frame:
-        cam2world_by_frame[f][:3, 3] -= world_origin
+        # Fallback: use first available pose translation
+        available = sorted(pose2world_by_frame.keys())
+        world_origin = pose2world_by_frame[available[0]][:3, 3].copy()
+    for f in pose2world_by_frame:
+        pose2world_by_frame[f][:3, 3] -= world_origin
 
-    cache_dir = os.path.join(base_dir, f"cache_cam_kitti360_s{scale}_v2")
+    cache_dir = os.path.join(base_dir, f"cache_cam_kitti360_{camera_name}_s{scale}_v3")
     meta_file = os.path.join(cache_dir, "meta.json")
     os.makedirs(cache_dir, exist_ok=True)
-    meta = {"W": W, "H": H, "undistorted": True, "method": "undistort_K_raw"}
+    meta = {"W": W, "H": H, "undistorted": True, "method": "undistort_K_raw", "camera_name": camera_name}
     import json as _json
     import glob as _glob
     if os.path.exists(meta_file):
@@ -336,13 +370,14 @@ def load_kitti360_cameras(
                 print(red(f"[KITTI-360 cam] Image not found: {img_path}, skipping frame {frame_id}"))
                 continue
 
-            # Find nearest cam2world (cam0_to_world.txt may have gaps)
-            if frame_id in cam2world_by_frame:
-                cam2world = cam2world_by_frame[frame_id]
+            # Find nearest pose entry (poses.txt may have gaps)
+            if frame_id in pose2world_by_frame:
+                pose2world = pose2world_by_frame[frame_id]
             else:
-                available = sorted(cam2world_by_frame.keys())
+                available = sorted(pose2world_by_frame.keys())
                 nearest = min(available, key=lambda f: abs(f - frame_id))
-                cam2world = cam2world_by_frame[nearest]
+                pose2world = pose2world_by_frame[nearest]
+            cam2world = pose2world @ cam_to_pose
 
             R = torch.tensor(cam2world[:3, :3], dtype=torch.float32)
             T = -R.T @ torch.tensor(cam2world[:3, 3], dtype=torch.float32)
@@ -364,7 +399,7 @@ def load_kitti360_cameras(
         cameras[frame_id] = cam
         images[frame_id] = image_tensor
 
-    print(blue(f"[KITTI-360 cam] Loaded {len(cameras)} camera frames "
+    print(blue(f"[KITTI-360 cam] Loaded {len(cameras)} {camera_name} frames "
                f"({W}×{H} @ 1/{scale} scale)"))
     return cameras, images
 
@@ -423,7 +458,7 @@ def load_kitti_raw(base_dir, args):
     beam_inclinations_bottom_to_top = get_kitti_hdl64e_beam_inclinations_rad(
         order="bottom_to_top"
     )
-    W, H = 1030, len(beam_inclinations_top_to_bottom)
+    W, H = resolve_kitti_lidar_width(args), len(beam_inclinations_top_to_bottom)
     max_depth = 80.0
 
     lidar = LiDARSensor(
@@ -483,6 +518,8 @@ def load_kitti_raw(base_dir, args):
             range_image_r2,
             ray_origin=ray_origin,
             ray_direction=ray_direction,
+            raw_points=xyzs,
+            raw_intensity=intensities,
         )
 
     lidar_bbox = load_lidar_bbox(

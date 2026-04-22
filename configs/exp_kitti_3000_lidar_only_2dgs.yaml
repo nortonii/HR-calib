@@ -3,7 +3,8 @@ parent_config: "configs/exp_kitti_3000.yaml"
 exp_name: "kitti_center_3000_lidar_only_2dgs"
 
 model:
-  camera_render_backend: surfel_rasterization
+  camera_render_backend: 3dgut
+  raytrace_backend: 3dgrt
   use_pose_correction: False
 
 opt:

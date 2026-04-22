@@ -350,10 +350,17 @@ def render_camera_2dgs(camera, gaussian_assets, args, scaling_modifier=1.0,
     rgb = rendered_image[:3]
     alpha = allmap[1:2]
     expected_depth = allmap[0:1] / alpha.clamp_min(1.0e-8)
-    depth = expected_depth.squeeze(0)
+    median_depth = (
+        allmap[5:6]
+        if allmap.dim() >= 3 and allmap.shape[0] > 5
+        else expected_depth
+    )
+    depth = median_depth.squeeze(0)
     return {
         "rgb": rgb.permute(1, 2, 0),
         "depth": depth,
+        "depth_expected": expected_depth.squeeze(0),
+        "depth_median": median_depth.squeeze(0),
         "alpha": alpha.squeeze(0),
         "screenspace_points": screenspace_points,
         "radii": _radii,

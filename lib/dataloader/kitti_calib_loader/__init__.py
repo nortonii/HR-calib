@@ -18,6 +18,7 @@ from lib.utils.console_utils import *
 from lib.utils.kitti_utils import (
     build_kitti_range_image_from_points,
     interpolate_sensor2world_columns,
+    resolve_kitti_lidar_width,
 )
 from lib.utils.velodyne_utils import get_kitti_hdl64e_beam_inclinations_rad
 
@@ -216,7 +217,7 @@ def load_kitti_calib_raw(base_dir, args):
     beam_inclinations_bottom_to_top = get_kitti_hdl64e_beam_inclinations_rad(
         order="bottom_to_top"
     )
-    W, H = 1030, len(beam_inclinations_top_to_bottom)
+    W, H = resolve_kitti_lidar_width(args), len(beam_inclinations_top_to_bottom)
     max_depth = 80.0
 
     sensor2ego = np.eye(4, dtype=np.float64)

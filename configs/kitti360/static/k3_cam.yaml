@@ -7,3 +7,6 @@ eval_frames: [105, 112, 119, 126]
 scene_id: kn3_cam
 
 dynamic: False
+
+model:
+  bkgd_init_min_distance: 3.0

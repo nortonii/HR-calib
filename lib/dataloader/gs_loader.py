@@ -48,6 +48,42 @@ def _sample_inverse_distance_sphere_points(points, color_intensity, num_points):
     return sampled_points, sampled_color_intensity, sampled_normals
 
 
+def _resolve_init_scale(configured_scale: float, fallback_scale: float) -> float:
+    scale = float(configured_scale)
+    if scale > 0.0:
+        return scale
+    return max(float(fallback_scale), 1.0e-3)
+
+
+def _resolve_inverse_distance_init_num(args) -> int:
+    model_cfg = getattr(args, "model", None)
+    if model_cfg is None:
+        return 0
+    data_type = str(getattr(args, "data_type", "")).strip().lower()
+    if data_type == "kitticalib":
+        override = getattr(model_cfg, "kitticalib_inverse_distance_init_num", None)
+        if override is not None:
+            return max(int(override), 0)
+    return max(int(getattr(model_cfg, "inverse_distance_init_num", 0)), 0)
+
+
+def _filter_points_by_min_distance(
+    points: torch.Tensor,
+    intensities: torch.Tensor,
+    sensor_center: torch.Tensor,
+    min_distance: float,
+    normals: torch.Tensor | None = None,
+):
+    threshold = float(min_distance)
+    if threshold <= 0.0 or points.numel() == 0:
+        return points, intensities, normals
+
+    center = sensor_center.to(device=points.device, dtype=points.dtype).reshape(1, 3)
+    keep_mask = torch.norm(points - center, dim=1) >= threshold
+    filtered_normals = None if normals is None else normals[keep_mask]
+    return points[keep_mask], intensities[keep_mask], filtered_normals
+
+
 class SceneLidar(Scene):
     def __init__(self, args, waymo_raw_pkg, shuffle=True, resize_ratio=1, test=False):
         scene_id = (
@@ -125,8 +161,12 @@ class SceneLidar(Scene):
         scene_id    = str(getattr(args, "scene_id", "scene"))
         data_scene  = str(getattr(args, "kitti_calib_scene", scene_id))
         voxel_size  = float(getattr(args.model, "voxel_size", 0.15))
+        min_init_distance = float(getattr(args.model, "bkgd_init_min_distance", 0.0))
         use_voxel   = bool(getattr(args.opt, "use_voxel_init", True))
-        cache_key   = f"fr{frame_range[0]}_{frame_range[1]}_vs{voxel_size}_vx{int(use_voxel)}"
+        cache_key   = (
+            f"v4_fr{frame_range[0]}_{frame_range[1]}_"
+            f"vs{voxel_size}_vx{int(use_voxel)}_md{min_init_distance:.3f}"
+        )
         cache_path  = os.path.join(source_dir, data_scene, f".init_cache_{cache_key}.npz")
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
 
@@ -141,7 +181,20 @@ class SceneLidar(Scene):
             all_intensity = []
             all_normals = []
             for frame in range(frame_range[0], frame_range[1] + 1):
-                lidar_pts, lidar_intensity = lidar.inverse_projection(frame)
+                lidar_pts, lidar_intensity = lidar.get_raw_points(frame, world=True)
+                raw_point_count = int(lidar_pts.shape[0])
+                lidar_pts, lidar_intensity, _ = _filter_points_by_min_distance(
+                    lidar_pts,
+                    lidar_intensity,
+                    lidar.sensor_center[frame],
+                    min_init_distance,
+                )
+                removed_near_points = raw_point_count - int(lidar_pts.shape[0])
+                if removed_near_points > 0:
+                    print(
+                        f"[Init] Frame {frame}: filtered {removed_near_points} near-self points "
+                        f"(min_distance={min_init_distance:.2f}m)"
+                    )
 
                 points_lidar = o3d.geometry.PointCloud()
                 points_lidar.points = o3d.utility.Vector3dVector(
@@ -209,7 +262,7 @@ class SceneLidar(Scene):
             )
             print(f"[Init] Saved point cloud cache to {cache_path}")
 
-        inverse_distance_init_num = int(getattr(args.model, "inverse_distance_init_num", 0))
+        inverse_distance_init_num = _resolve_inverse_distance_init_num(args)
         if inverse_distance_init_num > 0:
             sampled_points, sampled_ip, sampled_normals = _sample_inverse_distance_sphere_points(
                 all_points, ip, inverse_distance_init_num
@@ -228,12 +281,24 @@ class SceneLidar(Scene):
             * torch.quantile(point_extent, 0.90).int().item()
         )
         self.gaussians_assets[0].extent = self.camera_extent
+        background_init_scale = _resolve_init_scale(
+            getattr(args.model, "bkgd_init_scale", 0.0),
+            voxel_size * 0.5,
+        )
 
         pcd = BasicPointCloud(all_points, ip, normals=normals)
-        self.gaussians_assets[0].create_from_pcd(pcd, args.opt.use_normal_init)
+        self.gaussians_assets[0].create_from_pcd(
+            pcd,
+            args.opt.use_normal_init,
+            init_scale=background_init_scale,
+        )
 
         # initialize objects points
         points_num = args.model.obj_pt_num
+        object_init_scale = _resolve_init_scale(
+            getattr(args.model, "obj_init_scale", 0.0),
+            background_init_scale,
+        )
         for gaussian_model in self.gaussians_assets[1:]:
             points = torch.cat(
                 [point for point, _, _ in gaussian_model.tmp_points_intensities_list],
@@ -284,7 +349,11 @@ class SceneLidar(Scene):
             drop_probs = torch.zeros(points.shape[0])
             ip = torch.stack([intensities, hit_probs, drop_probs], dim=1)
             pcd = BasicPointCloud(points, ip, normals=normals)
-            gaussian_model.create_from_pcd(pcd, args.opt.use_normal_init)
+            gaussian_model.create_from_pcd(
+                pcd,
+                args.opt.use_normal_init,
+                init_scale=object_init_scale,
+            )
             del gaussian_model.tmp_points_intensities_list
 
         print("[Loaded] object guassians")

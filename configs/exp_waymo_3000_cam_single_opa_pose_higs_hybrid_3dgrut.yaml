@@ -1,0 +1,27 @@
+parent_config: "configs/waymo/exp_3000.yaml"
+
+exp_name: "waymo_3000_cam_single_opa_pose_higs_hybrid_3dgrut"
+
+opt:
+  lambda_rgb_phase: 0.0
+  use_voxel_init: True
+
+model:
+  training_render_mode: hybrid_3dgrut
+  camera_render_backend: 3dgut
+  raytrace_backend: 3dgrt
+  use_pose_correction: True
+  pose_correction:
+    mode: all
+    translation_lr: 0.0015
+    rotation_lr: 0.001
+    accumulate_steps: 8
+    stage_translation: False
+    translation_warmup_rotation_error_deg: 3.0
+    translation_warmup_patience: 5
+    use_gt_translation: True
+    init_translation_std: 0.0
+    init_rotation_deg: 0.0
+    init_se3: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    lambda_translation: 0.0
+    lambda_rotation: 0.0

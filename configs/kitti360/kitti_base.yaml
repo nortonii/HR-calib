@@ -1,2 +1,3 @@
 data_type: "KITTI"
 source_dir: "data/kitti360"
+kitti360_camera: "image_00"

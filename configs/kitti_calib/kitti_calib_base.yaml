@@ -1,2 +1,6 @@
 data_type: "KITTICalib"
 source_dir: "data/kitti-calibration"
+
+model:
+  bkgd_init_min_distance: 3.0
+  kitticalib_inverse_distance_init_num: 0

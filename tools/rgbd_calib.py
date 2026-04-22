@@ -113,9 +113,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth_npz_key", default=None, help="Array key for .npz depth files.")
     parser.add_argument("--device", default="cuda", help="Matcher device: cuda or cpu.")
     parser.add_argument("--hf_endpoint", default="https://hf-mirror.com", help="Hugging Face endpoint used when local cache is missing.")
-    parser.add_argument("--matcher_resize", type=int, default=832, help="Input resize for MatchAnything RoMa.")
-    parser.add_argument("--matcher_max_keypoints", type=int, default=2048, help="Max keypoints passed to vismatch.")
-    parser.add_argument("--matcher_ransac_reproj_thresh", type=float, default=3.0, help="RANSAC reprojection threshold inside vismatch.")
+    parser.add_argument("--matcher_name", choices=("matchanything-roma", "minima-roma"), default="matchanything-roma",
+                        help="Sparse cross-modal matcher backend.")
+    parser.add_argument("--matcher_minima_root", type=str, default=None,
+                        help="Optional MINIMA repo root for matcher_name=minima-roma.")
+    parser.add_argument("--matcher_minima_ckpt", type=str, default=None,
+                        help="Optional MINIMA RoMa checkpoint path for matcher_name=minima-roma.")
+    parser.add_argument("--matcher_resize", type=int, default=832, help="Input resize for the matcher backend.")
+    parser.add_argument("--matcher_max_keypoints", type=int, default=2048, help="Max keypoints passed to MatchAnything.")
+    parser.add_argument("--matcher_ransac_reproj_thresh", type=float, default=3.0, help="RANSAC reprojection threshold inside MatchAnything.")
     parser.add_argument("--matcher_match_threshold", type=float, default=0.2, help="MatchAnything coarse match threshold.")
     parser.add_argument("--min_cross_matches", type=int, default=20, help="Minimum cross-modal matches per frame before depth filtering.")
     parser.add_argument("--min_depth_matches", type=int, default=12, help="Minimum valid RGB-depth 2D-3D correspondences per frame.")
@@ -142,6 +148,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temporal_regularization", type=float, default=0.0, help="Optional weak initialization prior weight on both rotation and translation during global refinement.")
     parser.add_argument("--staged_refinement", action="store_true", help="Run rotation-first then translation-focused staged refinement before the final joint optimization.")
     parser.add_argument("--staged_depth_split", type=float, default=20.0, help="Depth threshold in meters used to separate far points for rotation and near points for translation during staged refinement.")
+    parser.add_argument("--solver_backend", choices=("auto", "opencv", "scipy"), default="auto", help="Shared extrinsic refinement backend. 'auto' prefers OpenCV solvePnPRefineLM when compatible, otherwise falls back to SciPy.")
     parser.add_argument("--save_visualizations", action="store_true", help="Save per-frame RGB-depth overlay images.")
     parser.add_argument("--max_frames", type=int, default=None, help="Optionally truncate the sequence after this many frame pairs.")
     return parser.parse_args()
@@ -166,12 +173,15 @@ def main() -> None:
     rgb_camera = load_camera_model(args.rgb_intrinsics)
     depth_camera = load_camera_model(args.depth_intrinsics)
     matcher = build_matcher(
+        matcher_name=args.matcher_name,
         device=args.device,
         max_num_keypoints=args.matcher_max_keypoints,
         ransac_reproj_thresh=args.matcher_ransac_reproj_thresh,
         img_resize=args.matcher_resize,
         match_threshold=args.matcher_match_threshold,
         hf_endpoint=args.hf_endpoint,
+        minima_root=args.matcher_minima_root,
+        minima_ckpt=args.matcher_minima_ckpt,
     )
 
     rgb_images = [load_rgb_image(path) for path in rgb_paths]
@@ -250,6 +260,7 @@ def main() -> None:
             reproj_error=args.pnp_reproj_error,
             iterations=args.pnp_iterations,
             min_inliers=args.min_pnp_inliers,
+            filter_frames=False,
         )
     for frame_data in frame_data_list:
         print(
@@ -319,6 +330,7 @@ def main() -> None:
         temporal_regularization=args.temporal_regularization,
         staged_refinement=args.staged_refinement,
         staged_depth_split=args.staged_depth_split,
+        solver_backend=args.solver_backend,
     )
     calibration = comparison.optimized
 

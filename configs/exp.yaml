@@ -15,7 +15,9 @@ model:
   obj_pt_num: 10_000
   dimension: 2
   sh_degree: 3
-  camera_render_backend: rasterization
+  dc_only_sh: true
+  camera_render_backend: 3dgut
+  raytrace_backend: 3dgrt
   freeze_gaussian_centers: False
 
 opt:

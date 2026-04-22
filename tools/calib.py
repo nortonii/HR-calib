@@ -17,7 +17,7 @@ python tools/calib.py \\
     --init_rot_deg 9.9239 --init_rot_axis 0.5774 0.5774 0.5774 \\
     --total_cycles 300 --iters_per_cycle 150 \\
     --rotation_lr 0.002 --warmup_cycles 1 \\
-    --output_dir output/calib/my_exp
+    --output_dir /mnt/xzy/hr-tiny-output/calib/my_exp
 
 Usage (KITTI-360)
 -----
@@ -27,7 +27,7 @@ python tools/calib.py \\
     --init_rot_deg 5.0 --init_rot_axis 0.5774 0.5774 0.5774 \\
     --total_cycles 300 --iters_per_cycle 150 \\
     --rotation_lr 0.002 --warmup_cycles 1 \\
-    --output_dir output/calib/kitti360_k3
+    --output_dir /mnt/xzy/hr-tiny-output/calib/kitti360_k3
 
 Usage (Waymo)
 -----
@@ -37,7 +37,7 @@ python tools/calib.py \\
     --init_rot_deg 5.0 --init_rot_axis 0.5774 0.5774 0.5774 \\
     --total_cycles 300 --iters_per_cycle 150 \\
     --rotation_lr 0.002 --warmup_cycles 1 \\
-    --output_dir output/calib/waymo_t0
+    --output_dir /mnt/xzy/hr-tiny-output/calib/waymo_t0
 
 Usage (PandaSet)
 -----
@@ -47,11 +47,12 @@ python tools/calib.py \\
     --init_rot_deg 5.0 --init_rot_axis 0.5774 0.5774 0.5774 \\
     --total_cycles 300 --iters_per_cycle 150 \\
     --rotation_lr 0.002 --warmup_cycles 1 \\
-    --output_dir output/calib/pandaset_1
+    --output_dir /mnt/xzy/hr-tiny-output/calib/pandaset_1
 """
 
 import argparse
 import math
+import json
 import os
 import random
 import shlex
@@ -83,20 +84,30 @@ from lib.dataloader.waymo_loader import load_waymo_cameras
 from lib.gaussian_renderer import raytracing
 from lib.gaussian_renderer.camera_render import render_camera
 from lib.scene.camera_pose_correction import CameraPoseCorrection
+from lib.scene.cameras import Camera
 from lib.utils.console_utils import blue, green, red, yellow
 from lib.utils.graphics_utils import fov2focal
 from lib.utils.image_utils import psnr
 from lib.utils.loss_utils import l1_loss, ssim
+from lib.utils.other_utils import depth2normal
 from lib.utils.rgbd_calibration import (
     _format_matcher_image,
     CameraModel,
     TemporalDepthResidualData,
     TemporalPhotometricResidualData,
     TemporalResidualData,
+    build_weighted_frame_data_list,
     build_frame_correspondence,
     build_matcher,
     depth_to_match_image,
+    filter_frame_correspondence_by_reference_cloud,
+    filter_frame_data_by_gt_reprojection,
+    filter_frame_data_by_shared_ransac,
+    filter_frame_data_by_pose_disagreement,
+    filter_frame_data_by_single_frame_pnp_stability,
+    filter_frame_data_by_reprojection_consensus,
     initialize_shared_extrinsic,
+    learn_gt_point_weight_predictor,
     match_cross_modal,
     match_cross_modal_dense,
     optimize_shared_extrinsic,
@@ -105,6 +116,9 @@ from lib.utils.rgbd_calibration import (
     select_match_points,
     stratify_frame_data_by_depth,
 )
+
+
+DEFAULT_OUTPUT_ROOT = os.environ.get("HR_TINY_OUTPUT_ROOT", "/mnt/xzy/hr-tiny-output")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -164,18 +178,32 @@ def _rotation_error_deg(R_pred: torch.Tensor, R_gt: torch.Tensor) -> float:
 def _translation_error_m(pose_correction, gt_l2c_T: torch.Tensor) -> float:
     """L2 distance (metres) between current effective l2c translation and GT.
 
-    Uses the decoupled parametrisation: T_eff = T_base + delta_T,
-    consistent with corrected_rt() when use_gt_translation=False.
+    When shared extrinsics are enabled, this reports the effective LiDAR->camera
+    translation currently used by pose_correction, including GT-translation mode.
     """
-    base_T = pose_correction.base_lidar_to_camera_translation[0].float()
-    delta_T = pose_correction.delta_translations[0].float()
-    eff_T = base_T + delta_T
+    if getattr(pose_correction, "use_shared_lidar_extrinsic", False):
+        if bool(getattr(pose_correction, "use_gt_translation", False)):
+            eff_T = pose_correction.gt_lidar_to_camera_translation[0].float()
+        else:
+            base_T = pose_correction.base_lidar_to_camera_translation[0].float()
+            delta_T = pose_correction.delta_translations[0].float()
+            eff_T = base_T + delta_T
+    else:
+        base_T = pose_correction.base_translations[0].float()
+        delta_T = pose_correction.delta_translations[0].float()
+        eff_T = base_T + delta_T
     return (eff_T - gt_l2c_T).norm().item()
 
 
 def _effective_T(pose_correction) -> torch.Tensor:
     """Current effective l2c translation as float32 vector."""
-    base_T = pose_correction.base_lidar_to_camera_translation[0].float()
+    if getattr(pose_correction, "use_shared_lidar_extrinsic", False):
+        if bool(getattr(pose_correction, "use_gt_translation", False)):
+            return pose_correction.gt_lidar_to_camera_translation[0].float()
+        base_T = pose_correction.base_lidar_to_camera_translation[0].float()
+        delta_T = pose_correction.delta_translations[0].float()
+        return base_T + delta_T
+    base_T = pose_correction.base_translations[0].float()
     delta_T = pose_correction.delta_translations[0].float()
     return base_T + delta_T
 
@@ -186,6 +214,50 @@ def _effective_R(pose_correction) -> torch.Tensor:
     bq = F.normalize(pose_correction.base_lidar_to_camera_quat[0].float(), dim=0)
     eff_q = quaternion_multiply(dq, bq)
     return quaternion_to_matrix(eff_q)
+
+
+def _summarize_frame_correspondences(
+    frame_data_list: list,
+    rgb_camera: CameraModel,
+    gt_rvec: np.ndarray | None = None,
+    gt_tvec: np.ndarray | None = None,
+    ref_rvec: np.ndarray | None = None,
+    ref_tvec: np.ndarray | None = None,
+) -> list[dict]:
+    dist_coeffs = rgb_camera.dist if rgb_camera.dist.size > 0 else None
+    summaries: list[dict] = []
+    for frame_data in frame_data_list:
+        depths = np.asarray(frame_data.points_3d[:, 2], dtype=np.float64).reshape(-1)
+        summary = {
+            "frame_id": int(frame_data.frame_id),
+            "frame_name": str(frame_data.frame_name),
+            "num_matches": int(frame_data.points_3d.shape[0]),
+            "depth_median": float(np.median(depths)) if depths.size else float("nan"),
+            "depth_p10": float(np.percentile(depths, 10.0)) if depths.size else float("nan"),
+            "depth_p90": float(np.percentile(depths, 90.0)) if depths.size else float("nan"),
+            "single_frame_inliers": int(getattr(frame_data, "pnp_inliers", 0)),
+            "single_frame_reproj_px": float(getattr(frame_data, "pnp_reproj_error", float("nan"))),
+        }
+        for prefix, rvec, tvec in (
+            ("gt", gt_rvec, gt_tvec),
+            ("reference", ref_rvec, ref_tvec),
+        ):
+            if rvec is None or tvec is None or frame_data.points_3d.size == 0:
+                continue
+            projected, _ = cv2.projectPoints(
+                frame_data.points_3d.astype(np.float64),
+                np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+                np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+                rgb_camera.K,
+                dist_coeffs,
+            )
+            residual = projected.reshape(-1, 2) - frame_data.rgb_points
+            reproj = np.sqrt(np.sum(residual**2, axis=1))
+            summary[f"{prefix}_reproj_mean_px"] = float(np.mean(reproj))
+            summary[f"{prefix}_reproj_median_px"] = float(np.median(reproj))
+            summary[f"{prefix}_reproj_p90_px"] = float(np.percentile(reproj, 90.0))
+        summaries.append(summary)
+    return summaries
 
 
 def _camera_model_from_camera(camera) -> CameraModel:
@@ -228,6 +300,79 @@ def _camera_intrinsics_from_camera(camera) -> tuple[float, float, float, float]:
     )
 
 
+def _gaussian_points_in_camera_frame(
+    gaussians,
+    frame: int,
+    cam_rotation,
+    cam_translation,
+) -> np.ndarray:
+    points = gaussians.get_world_xyz(frame)
+    if torch.is_tensor(points):
+        points_np = np.asarray(points.detach().cpu().numpy(), dtype=np.float32)
+    else:
+        points_np = np.asarray(points, dtype=np.float32)
+    if points_np.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    if torch.is_tensor(cam_rotation):
+        cam_rotation_np = np.asarray(cam_rotation.detach().cpu().numpy(), dtype=np.float32)
+    else:
+        cam_rotation_np = np.asarray(cam_rotation, dtype=np.float32)
+    if torch.is_tensor(cam_translation):
+        cam_translation_np = np.asarray(cam_translation.detach().cpu().numpy(), dtype=np.float32).reshape(3)
+    else:
+        cam_translation_np = np.asarray(cam_translation, dtype=np.float32).reshape(3)
+    return points_np.reshape(-1, 3) @ cam_rotation_np + cam_translation_np.reshape(1, 3)
+
+
+def _make_render_intrinsics_override_camera(
+    camera,
+    *,
+    fx_scale: float = 1.0,
+    fy_scale: float = 1.0,
+    cx_offset: float = 0.0,
+    cy_offset: float = 0.0,
+):
+    fx, fy, cx, cy = _camera_intrinsics_from_camera(camera)
+    fx = float(fx) * float(fx_scale)
+    fy = float(fy) * float(fy_scale)
+    cx = float(cx) + float(cx_offset)
+    cy = float(cy) + float(cy_offset)
+    width = int(camera.image_width)
+    height = int(camera.image_height)
+    K = np.array(
+        [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    fovx = 2.0 * math.atan(float(width) / (2.0 * fx))
+    fovy = 2.0 * math.atan(float(height) / (2.0 * fy))
+    data_device = None
+    if torch.is_tensor(camera.R):
+        data_device = str(camera.R.device)
+    elif torch.is_tensor(camera.T):
+        data_device = str(camera.T.device)
+    else:
+        data_device = "cuda"
+    return Camera(
+        timestamp=camera.timestamp,
+        R=camera.R,
+        T=camera.T,
+        w=width,
+        h=height,
+        FoVx=fovx,
+        FoVy=fovy,
+        depth=camera.depth_map,
+        intensity=camera.intensity_map,
+        trans=camera.trans,
+        scale=camera.scale,
+        data_device=data_device,
+        K=K,
+    )
+
+
 def _blend_relative_transform(
     rotation_matrix: np.ndarray,
     translation: np.ndarray,
@@ -241,14 +386,695 @@ def _blend_relative_transform(
 
 
 def _render_camera_with_backend(camera, gaussian_assets, args, backend=None, **kwargs):
+    if backend is not None and str(backend).strip().lower() in {"lidar_zbuffer", "kitti360_lidar_zbuffer"}:
+        return _render_camera_with_lidar_zbuffer(camera, args, **kwargs)
+    if backend is not None and str(backend).strip().lower() in {"lidar_scanline_zbuffer", "kitti360_lidar_scanline_zbuffer"}:
+        return _render_camera_with_lidar_zbuffer(camera, args, use_scanlines=True, **kwargs)
+    if backend is not None and str(backend).strip().lower() in {"point_zbuffer", "gaussian_zbuffer", "kitti360_point_zbuffer"}:
+        return _render_camera_with_point_zbuffer(camera, gaussian_assets, **kwargs)
     if backend is None:
         return render_camera(camera, gaussian_assets, args, **kwargs)
-    prev_backend = getattr(getattr(args, "model", None), "camera_render_backend", "rasterization")
-    args.model.camera_render_backend = backend
+    model = getattr(args, "model", None)
+    if model is None:
+        return render_camera(camera, gaussian_assets, args, **kwargs)
+    prev_backend = getattr(model, "camera_render_backend", "rasterization")
+    prev_mode = getattr(model, "training_render_mode", None)
+    model.camera_render_backend = backend
+    model.training_render_mode = ""
     try:
         return render_camera(camera, gaussian_assets, args, **kwargs)
     finally:
-        args.model.camera_render_backend = prev_backend
+        model.camera_render_backend = prev_backend
+        model.training_render_mode = prev_mode
+
+
+def _render_camera_with_point_zbuffer(
+    camera,
+    gaussian_assets,
+    cam_rotation=None,
+    cam_translation=None,
+    require_rgb=False,
+    fill_kernel_size: int = 3,
+    fill_iterations: int = 2,
+):
+    frame = int(camera.timestamp)
+    if cam_rotation is None or cam_translation is None:
+        cam_rotation = camera.R
+        cam_translation = camera.T
+
+    if torch.is_tensor(cam_rotation):
+        cam_rotation_np = np.asarray(cam_rotation.detach().cpu().numpy(), dtype=np.float32)
+    else:
+        cam_rotation_np = np.asarray(cam_rotation, dtype=np.float32)
+    if torch.is_tensor(cam_translation):
+        cam_translation_np = np.asarray(cam_translation.detach().cpu().numpy(), dtype=np.float32).reshape(3)
+    else:
+        cam_translation_np = np.asarray(cam_translation, dtype=np.float32).reshape(3)
+
+    world_points = []
+    for pc in gaussian_assets:
+        pts = pc.get_world_xyz(frame)
+        if torch.is_tensor(pts):
+            pts_np = np.asarray(pts.detach().cpu().numpy(), dtype=np.float32)
+        else:
+            pts_np = np.asarray(pts, dtype=np.float32)
+        if pts_np.size > 0:
+            world_points.append(pts_np.reshape(-1, 3))
+
+    height = int(camera.image_height)
+    width = int(camera.image_width)
+    depth_map = np.zeros((height, width), dtype=np.float32)
+    support_mask = np.zeros((height, width), dtype=np.float32)
+    if not world_points:
+        depth_tensor = torch.from_numpy(depth_map).to(
+            device=camera.R.device if torch.is_tensor(camera.R) else "cpu",
+            dtype=torch.float32,
+        )
+        render_pkg = {
+            "depth": depth_tensor,
+            "depth_expected": depth_tensor,
+            "depth_median": depth_tensor,
+            "depth_integrated": depth_tensor,
+            "alpha": depth_tensor,
+            "num_visible": 0,
+            "render_backend": "point_zbuffer",
+        }
+        if require_rgb:
+            render_pkg["rgb"] = torch.zeros((height, width, 3), dtype=torch.float32, device=depth_tensor.device)
+        return render_pkg
+
+    points_world = np.concatenate(world_points, axis=0)
+    points_cam = points_world @ cam_rotation_np + cam_translation_np.reshape(1, 3)
+    z = points_cam[:, 2]
+    valid = np.isfinite(points_cam).all(axis=1) & (z > 1.0e-6)
+    if not np.any(valid):
+        depth_tensor = torch.from_numpy(depth_map).to(
+            device=camera.R.device if torch.is_tensor(camera.R) else "cpu",
+            dtype=torch.float32,
+        )
+        render_pkg = {
+            "depth": depth_tensor,
+            "depth_expected": depth_tensor,
+            "depth_median": depth_tensor,
+            "depth_integrated": depth_tensor,
+            "alpha": depth_tensor,
+            "num_visible": 0,
+            "render_backend": "point_zbuffer",
+        }
+        if require_rgb:
+            render_pkg["rgb"] = torch.zeros((height, width, 3), dtype=torch.float32, device=depth_tensor.device)
+        return render_pkg
+
+    points_cam = points_cam[valid]
+    z = z[valid]
+    if getattr(camera, "K", None) is not None:
+        if torch.is_tensor(camera.K):
+            K = np.asarray(camera.K.detach().cpu().numpy(), dtype=np.float32)
+        else:
+            K = np.asarray(camera.K, dtype=np.float32)
+        fx = float(K[0, 0])
+        fy = float(K[1, 1])
+        cx = float(K[0, 2])
+        cy = float(K[1, 2])
+    else:
+        fx = float(width) / (2.0 * math.tan(float(camera.FoVx) * 0.5))
+        fy = float(height) / (2.0 * math.tan(float(camera.FoVy) * 0.5))
+        cx = float(width) * 0.5
+        cy = float(height) * 0.5
+
+    u = points_cam[:, 0] * fx / z + cx
+    v = points_cam[:, 1] * fy / z + cy
+    iu = np.rint(u).astype(np.int32)
+    iv = np.rint(v).astype(np.int32)
+    inside = (iu >= 0) & (iu < width) & (iv >= 0) & (iv < height)
+    if np.any(inside):
+        iu = iu[inside]
+        iv = iv[inside]
+        z = z[inside]
+        lin = iv.astype(np.int64) * int(width) + iu.astype(np.int64)
+        inv_z = 1.0 / np.maximum(z, 1.0e-6)
+        order = np.argsort(lin, kind="stable")
+        lin = lin[order]
+        inv_z = inv_z[order]
+        unique_lin, first_idx = np.unique(lin, return_index=True)
+        max_inv_z = np.maximum.reduceat(inv_z, first_idx)
+        inv_depth = np.zeros((height * width,), dtype=np.float32)
+        inv_depth[unique_lin] = max_inv_z.astype(np.float32)
+        support_mask.reshape(-1)[unique_lin] = 1.0
+
+        kernel_size = max(int(fill_kernel_size), 0)
+        if kernel_size > 1 and int(fill_iterations) > 0:
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+            inv_depth_2d = inv_depth.reshape(height, width)
+            for _ in range(int(fill_iterations)):
+                dilated = cv2.dilate(inv_depth_2d, kernel, iterations=1)
+                inv_depth_2d = np.where(inv_depth_2d > 0.0, inv_depth_2d, dilated)
+            inv_depth = inv_depth_2d.reshape(-1)
+
+        positive = inv_depth > 0.0
+        flat_depth = np.zeros_like(inv_depth)
+        flat_depth[positive] = 1.0 / inv_depth[positive]
+        depth_map = flat_depth.reshape(height, width)
+
+    device = camera.R.device if torch.is_tensor(camera.R) else "cpu"
+    depth_tensor = torch.from_numpy(depth_map).to(device=device, dtype=torch.float32)
+    alpha_tensor = torch.from_numpy((depth_map > 0.0).astype(np.float32)).to(device=device, dtype=torch.float32)
+    render_pkg = {
+        "depth": depth_tensor,
+        "depth_expected": depth_tensor,
+        "depth_median": depth_tensor,
+        "depth_integrated": depth_tensor,
+        "alpha": alpha_tensor,
+        "num_visible": int(np.count_nonzero(depth_map > 0.0)),
+        "render_backend": "point_zbuffer",
+    }
+    if require_rgb:
+        render_pkg["rgb"] = torch.zeros((height, width, 3), dtype=torch.float32, device=device)
+    return render_pkg
+
+
+def _render_camera_with_lidar_zbuffer(
+    camera,
+    args,
+    cam_rotation=None,
+    cam_translation=None,
+    require_rgb=False,
+    fill_kernel_size: int = 3,
+    fill_iterations: int = 2,
+    use_scanlines: bool = False,
+    scanline_thickness: int = 2,
+    scanline_max_gap_px: float = 20.0,
+    scanline_max_depth_ratio: float = 1.25,
+):
+    lidar_sensor = getattr(args, "_calib_lidar_sensor", None)
+    if lidar_sensor is None:
+        raise ValueError("lidar_zbuffer backend requires args._calib_lidar_sensor to be set.")
+
+    frame = int(camera.timestamp)
+    if cam_rotation is None or cam_translation is None:
+        cam_rotation = camera.R
+        cam_translation = camera.T
+    if torch.is_tensor(cam_rotation):
+        cam_rotation_np = np.asarray(cam_rotation.detach().cpu().numpy(), dtype=np.float32)
+    else:
+        cam_rotation_np = np.asarray(cam_rotation, dtype=np.float32)
+    if torch.is_tensor(cam_translation):
+        cam_translation_np = np.asarray(cam_translation.detach().cpu().numpy(), dtype=np.float32).reshape(3)
+    else:
+        cam_translation_np = np.asarray(cam_translation, dtype=np.float32).reshape(3)
+
+    height = int(camera.image_height)
+    width = int(camera.image_width)
+    depth_map = np.zeros((height, width), dtype=np.float32)
+    if height <= 0 or width <= 0:
+        depth_tensor = torch.from_numpy(depth_map).to(
+            device=camera.R.device if torch.is_tensor(camera.R) else "cpu",
+            dtype=torch.float32,
+        )
+        render_pkg = {
+            "depth": depth_tensor,
+            "depth_expected": depth_tensor,
+            "depth_median": depth_tensor,
+            "depth_integrated": depth_tensor,
+            "alpha": depth_tensor,
+            "num_visible": 0,
+            "render_backend": "lidar_zbuffer",
+        }
+        if require_rgb:
+            render_pkg["rgb"] = torch.zeros((height, width, 3), dtype=torch.float32, device=depth_tensor.device)
+        return render_pkg
+
+    if getattr(camera, "K", None) is not None:
+        if torch.is_tensor(camera.K):
+            K = np.asarray(camera.K.detach().cpu().numpy(), dtype=np.float32)
+        else:
+            K = np.asarray(camera.K, dtype=np.float32)
+        fx = float(K[0, 0])
+        fy = float(K[1, 1])
+        cx = float(K[0, 2])
+        cy = float(K[1, 2])
+    else:
+        fx = float(width) / (2.0 * math.tan(float(camera.FoVx) * 0.5))
+        fy = float(height) / (2.0 * math.tan(float(camera.FoVy) * 0.5))
+        cx = float(width) * 0.5
+        cy = float(height) * 0.5
+
+    if not use_scanlines:
+        lidar_points_world, _ = lidar_sensor.inverse_projection(frame)
+        points_world = np.asarray(lidar_points_world.detach().cpu().numpy(), dtype=np.float32).reshape(-1, 3)
+        if points_world.size == 0:
+            depth_tensor = torch.from_numpy(depth_map).to(
+                device=camera.R.device if torch.is_tensor(camera.R) else "cpu",
+                dtype=torch.float32,
+            )
+            render_pkg = {
+                "depth": depth_tensor,
+                "depth_expected": depth_tensor,
+                "depth_median": depth_tensor,
+                "depth_integrated": depth_tensor,
+                "alpha": depth_tensor,
+                "num_visible": 0,
+                "render_backend": "lidar_zbuffer",
+            }
+            if require_rgb:
+                render_pkg["rgb"] = torch.zeros((height, width, 3), dtype=torch.float32, device=depth_tensor.device)
+            return render_pkg
+
+        points_cam = points_world @ cam_rotation_np + cam_translation_np.reshape(1, 3)
+        z = points_cam[:, 2]
+        valid = np.isfinite(points_cam).all(axis=1) & (z > 1.0e-6)
+        points_cam = points_cam[valid]
+        z = z[valid]
+        if points_cam.size > 0:
+            u = points_cam[:, 0] * fx / z + cx
+            v = points_cam[:, 1] * fy / z + cy
+            iu = np.rint(u).astype(np.int32)
+            iv = np.rint(v).astype(np.int32)
+            inside = (iu >= 0) & (iu < width) & (iv >= 0) & (iv < height)
+            iu = iu[inside]
+            iv = iv[inside]
+            z = z[inside]
+            if z.size > 0:
+                lin = iv.astype(np.int64) * int(width) + iu.astype(np.int64)
+                inv_z = 1.0 / np.maximum(z, 1.0e-6)
+                order = np.argsort(lin, kind="stable")
+                lin = lin[order]
+                inv_z = inv_z[order]
+                unique_lin, first_idx = np.unique(lin, return_index=True)
+                max_inv_z = np.maximum.reduceat(inv_z, first_idx)
+                inv_depth = np.zeros((height * width,), dtype=np.float32)
+                inv_depth[unique_lin] = max_inv_z.astype(np.float32)
+                kernel_size = max(int(fill_kernel_size), 0)
+                if kernel_size > 1 and int(fill_iterations) > 0:
+                    if kernel_size % 2 == 0:
+                        kernel_size += 1
+                    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+                    inv_depth_2d = inv_depth.reshape(height, width)
+                    for _ in range(int(fill_iterations)):
+                        dilated = cv2.dilate(inv_depth_2d, kernel, iterations=1)
+                        inv_depth_2d = np.where(inv_depth_2d > 0.0, inv_depth_2d, dilated)
+                    inv_depth = inv_depth_2d.reshape(-1)
+                positive = inv_depth > 0.0
+                flat_depth = np.zeros_like(inv_depth)
+                flat_depth[positive] = 1.0 / inv_depth[positive]
+                depth_map = flat_depth.reshape(height, width)
+
+        device = camera.R.device if torch.is_tensor(camera.R) else "cpu"
+        depth_tensor = torch.from_numpy(depth_map).to(device=device, dtype=torch.float32)
+        alpha_tensor = torch.from_numpy((depth_map > 0.0).astype(np.float32)).to(device=device, dtype=torch.float32)
+        render_pkg = {
+            "depth": depth_tensor,
+            "depth_expected": depth_tensor,
+            "depth_median": depth_tensor,
+            "depth_integrated": depth_tensor,
+            "alpha": alpha_tensor,
+            "num_visible": int(np.count_nonzero(depth_map > 0.0)),
+            "render_backend": "lidar_zbuffer",
+        }
+        if require_rgb:
+            render_pkg["rgb"] = torch.zeros((height, width, 3), dtype=torch.float32, device=device)
+        return render_pkg
+
+    inv_depth_2d = np.zeros((height, width), dtype=np.float32)
+
+    def _accumulate_range_return(return_num: int) -> None:
+        nonlocal inv_depth_2d
+        range_map = lidar_sensor.get_depth(frame, return_num=return_num)
+        if range_map is None:
+            return
+        if torch.is_tensor(range_map):
+            range_np = np.asarray(range_map.detach().cpu().numpy(), dtype=np.float32)
+        else:
+            range_np = np.asarray(range_map, dtype=np.float32)
+        if range_np.ndim != 2 or range_np.size == 0:
+            return
+
+        points_world = lidar_sensor.range2point(frame, range_np)
+        points_world = np.asarray(points_world.detach().cpu().numpy(), dtype=np.float32)
+        points_cam = points_world @ cam_rotation_np + cam_translation_np.reshape(1, 1, 3)
+        z = points_cam[..., 2]
+        valid = (
+            np.isfinite(points_cam).all(axis=-1)
+            & np.isfinite(range_np)
+            & (range_np > 0.0)
+            & (z > 1.0e-6)
+        )
+        if not np.any(valid):
+            return
+
+        u = points_cam[..., 0] * fx / z + cx
+        v = points_cam[..., 1] * fy / z + cy
+        iu = np.rint(u).astype(np.int32)
+        iv = np.rint(v).astype(np.int32)
+        inside = valid & (iu >= 0) & (iu < width) & (iv >= 0) & (iv < height)
+        if np.any(inside):
+            flat_lin = (iv[inside].astype(np.int64) * int(width)) + iu[inside].astype(np.int64)
+            flat_inv_z = (1.0 / np.maximum(z[inside], 1.0e-6)).astype(np.float32)
+            order = np.argsort(flat_lin, kind="stable")
+            flat_lin = flat_lin[order]
+            flat_inv_z = flat_inv_z[order]
+            unique_lin, first_idx = np.unique(flat_lin, return_index=True)
+            max_inv_z = np.maximum.reduceat(flat_inv_z, first_idx)
+            flat_buffer = inv_depth_2d.reshape(-1)
+            flat_buffer[unique_lin] = np.maximum(flat_buffer[unique_lin], max_inv_z.astype(np.float32))
+
+        if use_scanlines:
+            thickness = max(int(scanline_thickness), 1)
+            max_gap = float(max(scanline_max_gap_px, 1.0))
+            max_ratio = float(max(scanline_max_depth_ratio, 1.0))
+            row_count = int(range_np.shape[0])
+            for row in range(row_count):
+                row_mask = inside[row]
+                if np.count_nonzero(row_mask) < 2:
+                    continue
+                cols = np.flatnonzero(row_mask)
+                row_u = u[row]
+                row_v = v[row]
+                row_z = z[row]
+                for c0, c1 in zip(cols[:-1], cols[1:]):
+                    if c1 - c0 > 2:
+                        continue
+                    z0 = float(row_z[c0])
+                    z1 = float(row_z[c1])
+                    z_min = max(min(z0, z1), 1.0e-6)
+                    z_max = max(z0, z1)
+                    if z_max / z_min > max_ratio:
+                        continue
+                    p0 = np.array([row_u[c0], row_v[c0]], dtype=np.float32)
+                    p1 = np.array([row_u[c1], row_v[c1]], dtype=np.float32)
+                    gap = float(np.linalg.norm(p1 - p0))
+                    if not np.isfinite(gap) or gap <= 1.0 or gap > max_gap:
+                        continue
+                    tmp = np.zeros_like(inv_depth_2d)
+                    inv_val = float(max(1.0 / max(z0, 1.0e-6), 1.0 / max(z1, 1.0e-6)))
+                    cv2.line(
+                        tmp,
+                        (int(round(p0[0])), int(round(p0[1]))),
+                        (int(round(p1[0])), int(round(p1[1]))),
+                        color=inv_val,
+                        thickness=thickness,
+                        lineType=cv2.LINE_AA,
+                    )
+                    inv_depth_2d = np.maximum(inv_depth_2d, tmp)
+
+    _accumulate_range_return(return_num=1)
+    _accumulate_range_return(return_num=2)
+
+    kernel_size = max(int(fill_kernel_size), 0)
+    if kernel_size > 1 and int(fill_iterations) > 0:
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        for _ in range(int(fill_iterations)):
+            dilated = cv2.dilate(inv_depth_2d, kernel, iterations=1)
+            inv_depth_2d = np.where(inv_depth_2d > 0.0, inv_depth_2d, dilated)
+
+    positive = inv_depth_2d > 0.0
+    depth_map = np.zeros_like(inv_depth_2d)
+    depth_map[positive] = 1.0 / inv_depth_2d[positive]
+
+    device = camera.R.device if torch.is_tensor(camera.R) else "cpu"
+    depth_tensor = torch.from_numpy(depth_map).to(device=device, dtype=torch.float32)
+    alpha_tensor = torch.from_numpy((depth_map > 0.0).astype(np.float32)).to(device=device, dtype=torch.float32)
+    render_pkg = {
+        "depth": depth_tensor,
+        "depth_expected": depth_tensor,
+        "depth_median": depth_tensor,
+        "depth_integrated": depth_tensor,
+        "alpha": alpha_tensor,
+        "num_visible": int(np.count_nonzero(depth_map > 0.0)),
+        "render_backend": "lidar_zbuffer",
+    }
+    if require_rgb:
+        render_pkg["rgb"] = torch.zeros((height, width, 3), dtype=torch.float32, device=device)
+    return render_pkg
+
+
+def _resolve_camera_aux_depth(
+    render_pkg: dict,
+    depth_mode: str = "median",
+) -> torch.Tensor:
+    mode = str(depth_mode).strip().lower()
+    if mode == "median":
+        return render_pkg.get("depth_median", render_pkg["depth"])
+    if mode == "expected":
+        return render_pkg.get("depth_expected", render_pkg["depth"])
+    if mode == "depth":
+        return render_pkg["depth"]
+    raise ValueError(
+        f"Unsupported camera auxiliary depth mode '{depth_mode}'. "
+        "Expected one of: median, expected, depth."
+    )
+
+
+def _compute_lidar_depth_loss(
+    pred_depth: torch.Tensor,
+    gt_depth: torch.Tensor,
+    accumulation: torch.Tensor | None = None,
+    *,
+    loss_mode: str = "l1",
+    inverse_min_depth: float = 0.5,
+    use_visibility_weights: bool = False,
+    visible_weight: float = 2.0,
+    occluded_weight: float = 0.5,
+    outside_weight: float = 1.0,
+    visibility_tolerance: float = 0.25,
+) -> torch.Tensor:
+    pred = pred_depth.reshape(-1).float()
+    gt = gt_depth.reshape(-1).float()
+    if pred.numel() == 0:
+        return pred.new_zeros(())
+    mode = str(loss_mode).strip().lower()
+    if mode == "l1":
+        err = torch.abs(pred - gt)
+    elif mode in {"inverse", "inv_depth", "inverse_depth"}:
+        min_depth = float(inverse_min_depth)
+        pred_safe = torch.clamp(pred, min=min_depth)
+        gt_safe = torch.clamp(gt, min=min_depth)
+        err = torch.abs(pred_safe.reciprocal() - gt_safe.reciprocal())
+    else:
+        raise ValueError(
+            f"Unsupported LiDAR depth loss mode '{loss_mode}'. Expected one of: l1, inverse_depth."
+        )
+    if not use_visibility_weights:
+        return err.mean()
+
+    valid_pred = pred > 1.0e-6
+    if accumulation is not None:
+        valid_pred = valid_pred & (accumulation.reshape(-1).float() > 1.0e-4)
+    tol = float(visibility_tolerance)
+    occluded = valid_pred & (pred > (gt + tol))
+    visible = valid_pred & ~occluded
+    outside = ~valid_pred
+
+    weights = torch.full_like(err, float(outside_weight))
+    weights[visible] = float(visible_weight)
+    weights[occluded] = float(occluded_weight)
+    weight_sum = torch.clamp(weights.sum(), min=1.0e-8)
+    return (weights * err).sum() / weight_sum
+
+
+def _four_neighbor_support_mask(mask: torch.Tensor) -> torch.Tensor:
+    support = (
+        mask[2:, 1:-1]
+        & mask[:-2, 1:-1]
+        & mask[1:-1, 2:]
+        & mask[1:-1, :-2]
+    )
+    return torch.nn.functional.pad(
+        support,
+        (1, 1, 1, 1),
+        mode="constant",
+        value=False,
+    )
+
+
+def _compute_lidar_normal_loss(
+    pred_normal_map: torch.Tensor,
+    gt_normal_map: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    pred_normal_map = pred_normal_map.float()
+    gt_normal_map = gt_normal_map.float()
+    normal_mask = valid_mask.bool()
+    if not torch.any(normal_mask):
+        return pred_normal_map.new_zeros(())
+
+    pred_normal = pred_normal_map[normal_mask]
+    gt_normal = gt_normal_map[normal_mask]
+    valid_normals = torch.isfinite(pred_normal).all(dim=-1) & torch.isfinite(gt_normal).all(dim=-1)
+    if not torch.any(valid_normals):
+        return pred_normal_map.new_zeros(())
+    cosine = torch.sum(pred_normal[valid_normals] * gt_normal[valid_normals], dim=-1)
+    cosine = cosine.clamp(-1.0, 1.0)
+    return (1.0 - cosine).mean()
+
+
+def _depth_to_camera_normal_map(
+    depth_map: torch.Tensor,
+    camera,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    depth = depth_map.float()
+    if depth.dim() == 3 and depth.shape[-1] == 1:
+        depth = depth[..., 0]
+    if depth.dim() != 2:
+        raise ValueError(f"Expected 2D depth map, got shape {tuple(depth.shape)}")
+
+    height, width = depth.shape
+    valid_depth = torch.isfinite(depth) & (depth > 1.0e-6)
+    normal_map = torch.zeros((height, width, 3), device=depth.device, dtype=depth.dtype)
+    if height < 3 or width < 3:
+        return normal_map, torch.zeros_like(valid_depth, dtype=torch.bool)
+
+    fx, fy, cx, cy = _camera_intrinsics_from_camera(camera)
+    ys = torch.arange(height, device=depth.device, dtype=depth.dtype)
+    xs = torch.arange(width, device=depth.device, dtype=depth.dtype)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    z = depth
+    x = (grid_x - float(cx)) * z / float(fx)
+    y = (grid_y - float(cy)) * z / float(fy)
+    points = torch.stack([x, y, z], dim=-1)
+
+    dx = points[2:, 1:-1, :] - points[:-2, 1:-1, :]
+    dy = points[1:-1, 2:, :] - points[1:-1, :-2, :]
+    normals = torch.cross(dx, dy, dim=-1)
+    normals = F.normalize(normals, dim=-1)
+    ray_dir = F.normalize(points[1:-1, 1:-1, :], dim=-1)
+    sign = torch.sign(-torch.sum(normals * ray_dir, dim=-1, keepdim=True))
+    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+    normals = normals * sign
+    normal_map[1:-1, 1:-1, :] = normals
+
+    valid_normals = torch.zeros_like(valid_depth, dtype=torch.bool)
+    valid_normals[1:-1, 1:-1] = (
+        valid_depth[1:-1, 1:-1]
+        & valid_depth[2:, 1:-1]
+        & valid_depth[:-2, 1:-1]
+        & valid_depth[1:-1, 2:]
+        & valid_depth[1:-1, :-2]
+        & torch.isfinite(normals).all(dim=-1)
+    )
+    return normal_map, valid_normals
+
+
+def _compute_camera_depth_normal_consistency_loss(
+    pred_depth_map: torch.Tensor,
+    pred_normal_map: torch.Tensor,
+    camera,
+) -> torch.Tensor:
+    depth_normal_map, valid_mask = _depth_to_camera_normal_map(pred_depth_map, camera)
+    if not torch.any(valid_mask):
+        return pred_depth_map.new_zeros(())
+    pred_normal_map = pred_normal_map.float()
+    pred_normals = pred_normal_map[valid_mask]
+    depth_normals = depth_normal_map[valid_mask]
+    valid = (
+        torch.isfinite(pred_normals).all(dim=-1)
+        & torch.isfinite(depth_normals).all(dim=-1)
+    )
+    if not torch.any(valid):
+        return pred_depth_map.new_zeros(())
+    cosine = torch.sum(pred_normals[valid] * depth_normals[valid], dim=-1).clamp(-1.0, 1.0)
+    return (1.0 - cosine.abs()).mean()
+
+
+def _resolve_visualization_depth_backend(camera_aux_depth_render_backend: str) -> str:
+    backend = str(camera_aux_depth_render_backend).strip().lower()
+    if backend in {
+        "lidar_zbuffer",
+        "kitti360_lidar_zbuffer",
+        "lidar_scanline_zbuffer",
+        "kitti360_lidar_scanline_zbuffer",
+    }:
+        return "raytracing"
+    return camera_aux_depth_render_backend
+
+
+def _camera_rt_from_lidar_to_camera(
+    pose_correction,
+    frame_id: int,
+    extrinsic_rotation: torch.Tensor,
+    extrinsic_translation: torch.Tensor,
+    device=None,
+):
+    if not getattr(pose_correction, "use_shared_lidar_extrinsic", False):
+        return pose_correction.corrected_rt(frame_id, device=device)
+    if device is None:
+        device = (
+            extrinsic_rotation.device
+            if torch.is_tensor(extrinsic_rotation)
+            else pose_correction.delta_translations.device
+        )
+    frame_index = pose_correction._frame_index(frame_id)
+    extrinsic_rotation = extrinsic_rotation.to(device=device, dtype=torch.float32)
+    extrinsic_translation = extrinsic_translation.to(device=device, dtype=torch.float32).reshape(3)
+    lidar_world_rotation = pose_correction.lidar_world_rotations[frame_index].to(device=device, dtype=torch.float32)
+    lidar_world_translation = pose_correction.lidar_world_translations[frame_index].to(device=device, dtype=torch.float32)
+
+    camera_to_lidar_rotation = extrinsic_rotation.transpose(0, 1)
+    camera_to_lidar_translation = -(camera_to_lidar_rotation @ extrinsic_translation)
+    corrected_rotation = lidar_world_rotation @ camera_to_lidar_rotation
+    corrected_center = (
+        lidar_world_rotation @ camera_to_lidar_translation + lidar_world_translation
+    )
+    corrected_translation = -(corrected_rotation.T @ corrected_center)
+    return corrected_rotation, corrected_translation
+
+
+def _normalize_render_preset(value: str | None) -> str | None:
+    if value is None:
+        return None
+    preset = str(value).strip().lower()
+    aliases = {
+        "hybrid_3dgrut": "hybrid_3dgrut",
+        "hybrid-3dgrut": "hybrid_3dgrut",
+        "3dgrut_hybrid": "hybrid_3dgrut",
+        "3dgrut": "hybrid_3dgrut",
+        "3dgut": "hybrid_3dgrut",
+        "lidar_rt": "lidar_rt",
+        "lidar-rt": "lidar_rt",
+        "2dgs": "lidar_rt",
+    }
+    if preset not in aliases:
+        raise ValueError(
+            f"Unsupported render preset '{value}'. Expected one of: "
+            "hybrid_3dgrut, 3dgrut, lidar_rt, lidar-rt, 2dgs."
+        )
+    return aliases[preset]
+
+
+def _should_run_initial_pure_pnp(
+    *,
+    run_pending: bool,
+    cycle: int,
+    warmup_cycles: int,
+    total_cycles: int,
+) -> bool:
+    if not run_pending:
+        return False
+    warmup_cycles = int(max(warmup_cycles, 0))
+    total_cycles = int(max(total_cycles, 0))
+    trigger_cycle = (warmup_cycles + 1) if total_cycles > warmup_cycles else total_cycles
+    return int(cycle) == max(trigger_cycle, 1)
+
+
+def _apply_render_preset(args, preset: str) -> tuple[str, str]:
+    model = getattr(args, "model", None)
+    if model is None:
+        raise ValueError("args.model is required to apply a render preset.")
+    if preset == "hybrid_3dgrut":
+        model.training_render_mode = "hybrid_3dgrut"
+        model.camera_render_backend = "3dgut"
+        model.raytrace_backend = "3dgrt"
+        return "3dgut_rasterization", "3dgut_rasterization"
+    if preset == "lidar_rt":
+        model.training_render_mode = ""
+        model.camera_render_backend = "2dgs"
+        model.raytrace_backend = "lidar_rt"
+        return "raytracing", "raytracing"
+    raise ValueError(f"Unhandled render preset '{preset}'.")
 
 
 def _sample_image_colors(image_hwc: torch.Tensor, points_xy: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
@@ -432,7 +1258,8 @@ def _build_semidense_temporal_samples(
     source_depth: np.ndarray,
     source_c2w: np.ndarray,
     target_w2c: np.ndarray,
-    rgb_camera: CameraModel,
+    source_depth_camera: CameraModel,
+    target_depth_camera: CameraModel,
     target_depth: np.ndarray | None,
     support_points: np.ndarray | None,
     reliability_map: np.ndarray | None,
@@ -486,10 +1313,10 @@ def _build_semidense_temporal_samples(
         sampled_depth = sampled_depth[keep]
         point_weights = point_weights[keep]
 
-    fx = float(rgb_camera.K[0, 0])
-    fy = float(rgb_camera.K[1, 1])
-    cx = float(rgb_camera.K[0, 2])
-    cy = float(rgb_camera.K[1, 2])
+    fx = float(source_depth_camera.K[0, 0])
+    fy = float(source_depth_camera.K[1, 1])
+    cx = float(source_depth_camera.K[0, 2])
+    cy = float(source_depth_camera.K[1, 2])
     x = (source_pixels[:, 0] - cx) / fx * sampled_depth
     y = (source_pixels[:, 1] - cy) / fy * sampled_depth
     source_points_3d = np.stack([x, y, sampled_depth], axis=1).astype(np.float64)
@@ -499,7 +1326,7 @@ def _build_semidense_temporal_samples(
         source_c2w=source_c2w,
         target_w2c=target_w2c,
         target_depth=target_depth,
-        rgb_camera=rgb_camera,
+        target_depth_camera=target_depth_camera,
         min_depth=min_depth,
     )
     if not np.any(occlusion_keep):
@@ -533,7 +1360,7 @@ def _filter_points_by_target_occlusion(
     source_c2w: np.ndarray,
     target_w2c: np.ndarray,
     target_depth: np.ndarray | None,
-    rgb_camera: CameraModel,
+    target_depth_camera: CameraModel,
     occlusion_margin_m: float = 0.30,
     occlusion_margin_ratio: float = 0.02,
     min_depth: float = 0.10,
@@ -556,8 +1383,8 @@ def _filter_points_by_target_occlusion(
         target_rgb[valid].astype(np.float64),
         np.zeros((3, 1), dtype=np.float64),
         np.zeros((3, 1), dtype=np.float64),
-        rgb_camera.K,
-        rgb_camera.dist if rgb_camera.dist.size > 0 else None,
+        target_depth_camera.K,
+        target_depth_camera.dist if target_depth_camera.dist.size > 0 else None,
     )
     projected = projected.reshape(-1, 2)
     inside = (
@@ -599,7 +1426,9 @@ def _build_temporal_photometric_residuals(
     pose_correction,
     rgb_camera: CameraModel,
     source_depth_maps: dict[int, np.ndarray] | None = None,
+    source_depth_cameras: dict[int, CameraModel] | None = None,
     target_depth_maps: dict[int, np.ndarray] | None = None,
+    target_depth_cameras: dict[int, CameraModel] | None = None,
     match_radius_px: float = 4.0,
     min_matches: int = 8,
     semidense_stride: int = 0,
@@ -675,12 +1504,13 @@ def _build_temporal_photometric_residuals(
             target_w2c = pose_cache[target_frame][1]
 
             source_points_3d = np.asarray(source_frame_data.points_3d[point_indices], dtype=np.float64)
+            target_depth_camera = None if target_depth_cameras is None else target_depth_cameras.get(target_frame)
             occlusion_keep = _filter_points_by_target_occlusion(
                 source_points_3d=source_points_3d,
                 source_c2w=source_c2w,
                 target_w2c=target_w2c,
                 target_depth=None if target_depth_maps is None else target_depth_maps.get(target_frame),
-                rgb_camera=rgb_camera,
+                target_depth_camera=target_depth_camera if target_depth_camera is not None else rgb_camera,
                 min_depth=0.10,
             )
             if int(np.count_nonzero(occlusion_keep)) < int(min_matches):
@@ -718,7 +1548,16 @@ def _build_temporal_photometric_residuals(
                 source_depth=None if source_depth_maps is None else source_depth_maps.get(source_frame),
                 source_c2w=source_c2w,
                 target_w2c=target_w2c,
-                rgb_camera=rgb_camera,
+                source_depth_camera=(
+                    source_depth_cameras.get(source_frame)
+                    if source_depth_cameras is not None and source_frame in source_depth_cameras
+                    else rgb_camera
+                ),
+                target_depth_camera=(
+                    target_depth_cameras.get(target_frame)
+                    if target_depth_cameras is not None and target_frame in target_depth_cameras
+                    else rgb_camera
+                ),
                 target_depth=None if target_depth_maps is None else target_depth_maps.get(target_frame),
                 support_points=np.asarray(pts_cur, dtype=np.float32).reshape(-1, 2),
                 reliability_map=source_reliability,
@@ -757,6 +1596,7 @@ def _build_temporal_geometric_residuals(
     rgb_camera: CameraModel,
     cam_images: dict | None = None,
     target_depth_maps: dict[int, np.ndarray] | None = None,
+    target_depth_cameras: dict[int, CameraModel] | None = None,
     match_radius_px: float = 4.0,
     min_matches: int = 8,
     gradient_scale: float = 0.0,
@@ -819,12 +1659,13 @@ def _build_temporal_geometric_residuals(
                 pose_cache[target_frame] = _camera_pose_matrices_from_corrected_rt(tgt_R, tgt_T)
             target_w2c = pose_cache[target_frame][1]
             source_points_3d = np.asarray(source_frame_data.points_3d[point_indices], dtype=np.float64)
+            target_depth_camera = None if target_depth_cameras is None else target_depth_cameras.get(target_frame)
             occlusion_keep = _filter_points_by_target_occlusion(
                 source_points_3d=source_points_3d,
                 source_c2w=source_c2w,
                 target_w2c=target_w2c,
                 target_depth=None if target_depth_maps is None else target_depth_maps.get(target_frame),
-                rgb_camera=rgb_camera,
+                target_depth_camera=target_depth_camera if target_depth_camera is not None else rgb_camera,
                 min_depth=0.10,
             )
             if int(np.count_nonzero(occlusion_keep)) < int(min_matches):
@@ -860,8 +1701,10 @@ def _build_temporal_depth_residuals(
     pose_correction,
     rgb_camera: CameraModel,
     source_depth_maps: dict[int, np.ndarray] | None = None,
+    source_depth_cameras: dict[int, CameraModel] | None = None,
     cam_images: dict | None = None,
     target_depth_maps: dict[int, np.ndarray] | None = None,
+    target_depth_cameras: dict[int, CameraModel] | None = None,
     match_radius_px: float = 4.0,
     min_matches: int = 8,
     semidense_stride: int = 0,
@@ -927,12 +1770,13 @@ def _build_temporal_depth_residuals(
             target_w2c = pose_cache[target_frame][1]
 
             source_points_3d = np.asarray(source_frame_data.points_3d[point_indices], dtype=np.float64)
+            target_depth_camera = None if target_depth_cameras is None else target_depth_cameras.get(target_frame)
             occlusion_keep = _filter_points_by_target_occlusion(
                 source_points_3d=source_points_3d,
                 source_c2w=source_c2w,
                 target_w2c=target_w2c,
                 target_depth=None if target_depth_maps is None else target_depth_maps.get(target_frame),
-                rgb_camera=rgb_camera,
+                target_depth_camera=target_depth_camera if target_depth_camera is not None else rgb_camera,
                 min_depth=0.10,
             )
             if int(np.count_nonzero(occlusion_keep)) < int(min_matches):
@@ -962,7 +1806,16 @@ def _build_temporal_depth_residuals(
                 source_depth=None if source_depth_maps is None else source_depth_maps.get(source_frame),
                 source_c2w=source_c2w,
                 target_w2c=target_w2c,
-                rgb_camera=rgb_camera,
+                source_depth_camera=(
+                    source_depth_cameras.get(source_frame)
+                    if source_depth_cameras is not None and source_frame in source_depth_cameras
+                    else rgb_camera
+                ),
+                target_depth_camera=(
+                    target_depth_cameras.get(target_frame)
+                    if target_depth_cameras is not None and target_frame in target_depth_cameras
+                    else rgb_camera
+                ),
                 target_depth=None if target_depth_maps is None else target_depth_maps.get(target_frame),
                 support_points=np.asarray(pts_cur, dtype=np.float32).reshape(-1, 2),
                 reliability_map=source_reliability,
@@ -1572,6 +2425,8 @@ def _precompute_cycle_match_cache(
     dense_stride: int = 4,
     dense_cert_threshold: float = 0.02,
     dense_color_cert_threshold: float | None = None,
+    depth_render_backend: str = "3dgut_rasterization",
+    depth_render_mode: str = "median",
 ) -> dict:
     """Run cross-modal matching once per cycle for all train frames.
 
@@ -1606,7 +2461,7 @@ def _precompute_cycle_match_cache(
 
         depth_render = _render_camera_with_backend(
             camera, [gaussians], args,
-            backend="3dgut_rasterization",
+            backend=depth_render_backend,
             cam_rotation=cam_R.detach(),
             cam_translation=cam_T.detach(),
             require_rgb=False,
@@ -1614,7 +2469,8 @@ def _precompute_cycle_match_cache(
         if not int(depth_render.get("num_visible", 0)):
             continue
 
-        depth_np = depth_render["depth"].squeeze(-1).cpu().numpy().astype(np.float32)
+        depth_tensor = _resolve_camera_aux_depth(depth_render, depth_mode=depth_render_mode)
+        depth_np = depth_tensor.squeeze(-1).cpu().numpy().astype(np.float32)
         gt_valid_mask = None if camera_masks is None else camera_masks.get(int(frame))
         gt_rgb_np_uint8 = _mask_image_for_matcher(gt_rgb, gt_valid_mask)
         gt_rgb_cpu_f32  = gt_rgb.cpu()             # float32 HWC for colour sampling
@@ -1931,6 +2787,7 @@ def _run_matcher_pose_update(
     matcher_depth_use_inverse: bool,
     matcher_update_blend: float,
     depth_render_backend: str = "3dgut_rasterization",
+    depth_render_mode: str = "median",
     temporal_pair_cache: dict[int, list[tuple[int, np.ndarray, np.ndarray]]] | None = None,
     temporal_photometric_weight: float = 0.0,
     temporal_photometric_match_radius_px: float = 4.0,
@@ -1952,6 +2809,35 @@ def _run_matcher_pose_update(
     rgb_blur_sigma: float = 0.0,
     temporal_support_getter=None,
     temporal_support_radius_px: float = 6.0,
+    pure_pnp_residual_filter_mad_scale: float = 0.0,
+    pure_pnp_residual_filter_min_keep_ratio: float = 0.5,
+    pure_pnp_residual_filter_min_keep_per_frame: int = 24,
+    pure_pnp_residual_filter_max_reproj_error: float = 0.0,
+    pure_pnp_single_frame_prefilter_min_inliers: int = 0,
+    pure_pnp_single_frame_prefilter_min_inlier_ratio: float = 0.0,
+    pure_pnp_frame_disagreement_mad_scale: float = 0.0,
+    pure_pnp_frame_disagreement_min_keep_ratio: float = 0.7,
+    pure_pnp_frame_disagreement_min_keep_frames: int = 12,
+    pure_pnp_frame_disagreement_apply_max_dropped_frames: int = 0,
+    pure_pnp_filter_shared_ransac_outliers: bool = False,
+    pure_pnp_gt_reproj_filter_quantile: float = 0.0,
+    pure_pnp_gt_reproj_filter_min_keep_per_frame: int = 24,
+    pure_pnp_gt_soft_weight_mode: str = "none",
+    pure_pnp_gt_soft_weight_translation_alpha: float = 0.5,
+    pure_pnp_gt_pose_residual_weight: float = 0.0,
+    pure_pnp_optimize_rotation: bool = True,
+    pure_pnp_optimize_translation: bool = True,
+    pure_pnp_solver_backend: str = "auto",
+    matcher_lidar_nn_max_distance: float = 0.0,
+    render_intrinsics_fx_scale: float = 1.0,
+    render_intrinsics_fy_scale: float = 1.0,
+    render_intrinsics_cx_offset: float = 0.0,
+    render_intrinsics_cy_offset: float = 0.0,
+    gt_rotation_matrix: np.ndarray | None = None,
+    gt_translation: np.ndarray | None = None,
+    match_diagnostics_path: str | None = None,
+    gt_weight_analysis_json_path: str | None = None,
+    gt_weight_analysis_npz_path: str | None = None,
 ):
     if not frame_ids:
         return {"status": "skipped", "reason": "no camera frames"}
@@ -1959,6 +2845,9 @@ def _run_matcher_pose_update(
     rgb_camera_model = _camera_model_from_camera(cam_cameras[frame_ids[0]])
     frame_data_list = []
     rendered_depth_maps: dict[int, np.ndarray] = {}
+    rendered_depth_cameras: dict[int, CameraModel] = {}
+    lidar_nn_total_points = 0
+    lidar_nn_kept_points = 0
     n_pnp_frames = len([f for f in frame_ids if f in cam_cameras and f in cam_images])
     for fi, frame in enumerate(frame_ids):
         if frame not in cam_cameras or frame not in cam_images:
@@ -1966,6 +2855,14 @@ def _run_matcher_pose_update(
         if fi % 10 == 0:
             print(f"[PnP init] rendering frame {fi+1}/{n_pnp_frames} (id={frame})...", flush=True)
         camera = cam_cameras[frame].cuda()
+        render_camera = _make_render_intrinsics_override_camera(
+            camera,
+            fx_scale=render_intrinsics_fx_scale,
+            fy_scale=render_intrinsics_fy_scale,
+            cx_offset=render_intrinsics_cx_offset,
+            cy_offset=render_intrinsics_cy_offset,
+        )
+        render_camera_model = _camera_model_from_camera(render_camera)
         gt_rgb = cam_images[frame].detach().cpu().numpy()
         if gt_rgb.max(initial=0.0) <= 1.5:
             gt_rgb = np.clip(gt_rgb * 255.0, 0.0, 255.0).astype(np.uint8)
@@ -1986,7 +2883,7 @@ def _run_matcher_pose_update(
 
         cam_R, cam_T = pose_correction.corrected_rt(frame, device="cuda")
         render_pkg = _render_camera_with_backend(
-            camera,
+            render_camera,
             [gaussians],
             args,
             backend=depth_render_backend,
@@ -1997,8 +2894,10 @@ def _run_matcher_pose_update(
         if int(render_pkg.get("num_visible", 0)) <= 0:
             continue
 
-        depth = render_pkg["depth"].detach().squeeze(-1).cpu().numpy().astype(np.float32)
+        depth_tensor = _resolve_camera_aux_depth(render_pkg, depth_mode=depth_render_mode)
+        depth = depth_tensor.detach().squeeze(-1).cpu().numpy().astype(np.float32)
         rendered_depth_maps[int(frame)] = depth
+        rendered_depth_cameras[int(frame)] = render_camera_model
         depth_vis = depth_to_match_image(
             depth,
             percentile_low=matcher_depth_percentile_low,
@@ -2032,7 +2931,7 @@ def _run_matcher_pose_update(
             rgb_points=rgb_points,
             depth_points=depth_points,
             depth_map=depth,
-            depth_camera=rgb_camera_model,
+            depth_camera=render_camera_model,
             min_depth=matcher_depth_min,
             max_depth=matcher_depth_max,
             search_radius=2,
@@ -2041,6 +2940,23 @@ def _run_matcher_pose_update(
         )
         if frame_data is None or frame_data.points_3d.shape[0] < int(matcher_min_depth_matches):
             continue
+        if float(matcher_lidar_nn_max_distance) > 0.0:
+            lidar_reference_points = _gaussian_points_in_camera_frame(
+                gaussians,
+                int(frame),
+                cam_R,
+                cam_T,
+            )
+            frame_data_filtered, lidar_nn_diag = filter_frame_correspondence_by_reference_cloud(
+                frame_data,
+                reference_points=lidar_reference_points,
+                max_distance=float(matcher_lidar_nn_max_distance),
+            )
+            lidar_nn_total_points += int(lidar_nn_diag.get("total_points", 0))
+            lidar_nn_kept_points += int(lidar_nn_diag.get("kept_points", 0))
+            frame_data = frame_data_filtered
+            if frame_data is None or frame_data.points_3d.shape[0] < int(matcher_min_depth_matches):
+                continue
         frame_data.frame_id = int(frame)
         frame_data.frame_index = len(frame_data_list)
         frame_data_list.append(frame_data)
@@ -2070,7 +2986,9 @@ def _run_matcher_pose_update(
             pose_correction=pose_correction,
             rgb_camera=rgb_camera_model,
             source_depth_maps=rendered_depth_maps,
+            source_depth_cameras=rendered_depth_cameras,
             target_depth_maps=rendered_depth_maps,
+            target_depth_cameras=rendered_depth_cameras,
             match_radius_px=temporal_photometric_match_radius_px,
             min_matches=temporal_photometric_min_matches,
             semidense_stride=temporal_semidense_stride,
@@ -2085,6 +3003,7 @@ def _run_matcher_pose_update(
             rgb_camera=rgb_camera_model,
             cam_images=cam_images,
             target_depth_maps=rendered_depth_maps,
+            target_depth_cameras=rendered_depth_cameras,
             match_radius_px=temporal_flow_match_radius_px,
             min_matches=temporal_flow_min_matches,
             gradient_scale=temporal_gradient_scale,
@@ -2096,14 +3015,42 @@ def _run_matcher_pose_update(
             pose_correction=pose_correction,
             rgb_camera=rgb_camera_model,
             source_depth_maps=rendered_depth_maps,
+            source_depth_cameras=rendered_depth_cameras,
             cam_images=cam_images,
             target_depth_maps=rendered_depth_maps,
+            target_depth_cameras=rendered_depth_cameras,
             match_radius_px=temporal_depth_match_radius_px,
             min_matches=temporal_depth_min_matches,
             semidense_stride=temporal_semidense_stride,
             semidense_max_points=temporal_semidense_max_points,
             gradient_scale=temporal_gradient_scale,
         )
+
+    raw_matches_total = int(sum(frame.points_3d.shape[0] for frame in frame_data_list))
+    frame_filter_diagnostics = None
+    filter_diagnostics = None
+    single_frame_prefilter_diagnostics = None
+    shared_ransac_diagnostics = None
+    gt_reproj_filter_diagnostics = None
+    gt_weight_summary = None
+    gt_weight_arrays = None
+    filtered_matches_total = raw_matches_total
+    gt_rvec = None
+    gt_tvec = None
+    if gt_rotation_matrix is not None and gt_translation is not None:
+        current_l2c_R, current_l2c_T = pose_correction.corrected_lidar_to_camera(
+            int(frame_ids[0]),
+            device="cpu",
+        )
+        current_l2c_R_np = np.asarray(current_l2c_R.detach().cpu().numpy(), dtype=np.float64)
+        current_l2c_T_np = np.asarray(current_l2c_T.detach().cpu().numpy(), dtype=np.float64).reshape(3)
+        gt_l2c_R_np = np.asarray(gt_rotation_matrix, dtype=np.float64)
+        gt_l2c_T_np = np.asarray(gt_translation, dtype=np.float64).reshape(3)
+        gt_relative_R = gt_l2c_R_np @ current_l2c_R_np.T
+        gt_relative_T = gt_l2c_T_np - (gt_relative_R @ current_l2c_T_np.reshape(3, 1)).reshape(3)
+        gt_rvec, _ = cv2.Rodrigues(gt_relative_R)
+        gt_rvec = gt_rvec.reshape(3)
+        gt_tvec = gt_relative_T.reshape(3)
 
     try:
         initial_rvec, initial_tvec = initialize_shared_extrinsic(
@@ -2112,9 +3059,205 @@ def _run_matcher_pose_update(
             reproj_error=matcher_pnp_reproj_error,
             iterations=matcher_pnp_iterations,
             min_inliers=matcher_min_pnp_inliers,
+            filter_frames=False,
         )
+        active_frame_data_list = frame_data_list
+        if pure_pnp_filter_shared_ransac_outliers:
+            _, _, ransac_filtered_frames, shared_ransac_diagnostics = filter_frame_data_by_shared_ransac(
+                frame_data_list=frame_data_list,
+                rgb_camera=rgb_camera_model,
+                reproj_error=matcher_pnp_reproj_error,
+                iterations=matcher_pnp_iterations,
+                min_inliers=matcher_min_pnp_inliers,
+                gt_rvec=gt_rvec,
+                gt_tvec=gt_tvec,
+            )
+            if ransac_filtered_frames:
+                active_frame_data_list = ransac_filtered_frames
+                filtered_matches_total = int(sum(frame.points_3d.shape[0] for frame in active_frame_data_list))
+        if (
+            pure_pnp_gt_reproj_filter_quantile > 0.0
+            and gt_rvec is not None
+            and gt_tvec is not None
+        ):
+            gt_filtered_frames, gt_reproj_filter_diagnostics = filter_frame_data_by_gt_reprojection(
+                frame_data_list=active_frame_data_list,
+                rgb_camera=rgb_camera_model,
+                gt_rvec=gt_rvec,
+                gt_tvec=gt_tvec,
+                reference_rvec=initial_rvec,
+                reference_tvec=initial_tvec,
+                keep_quantile=pure_pnp_gt_reproj_filter_quantile,
+                min_keep_per_frame=pure_pnp_gt_reproj_filter_min_keep_per_frame,
+            )
+            if gt_filtered_frames:
+                active_frame_data_list = gt_filtered_frames
+                filtered_matches_total = int(sum(frame.points_3d.shape[0] for frame in active_frame_data_list))
+        if (
+            (gt_weight_analysis_json_path is not None or pure_pnp_gt_soft_weight_mode != "none")
+            and gt_rvec is not None
+            and gt_tvec is not None
+        ):
+            gt_weight_summary, gt_weight_arrays = learn_gt_point_weight_predictor(
+                frame_data_list=active_frame_data_list,
+                rgb_camera=rgb_camera_model,
+                init_rvec=initial_rvec,
+                init_tvec=initial_tvec,
+                gt_rvec=gt_rvec,
+                gt_tvec=gt_tvec,
+                gt_pose_residual_weight=pure_pnp_gt_pose_residual_weight,
+                reproj_error=matcher_pnp_reproj_error,
+                iterations=matcher_pnp_iterations,
+                min_inliers=matcher_min_pnp_inliers,
+                supervision_target=(
+                    "gt_pose_balance"
+                    if pure_pnp_gt_soft_weight_mode == "pose_balance"
+                    else "gt_reproj"
+                ),
+                translation_sensitivity_alpha=pure_pnp_gt_soft_weight_translation_alpha,
+            )
+            if gt_weight_analysis_json_path is not None:
+                os.makedirs(os.path.dirname(gt_weight_analysis_json_path), exist_ok=True)
+                with open(gt_weight_analysis_json_path, "w", encoding="utf-8") as f:
+                    json.dump(gt_weight_summary, f, indent=2)
+            if gt_weight_analysis_npz_path is not None and gt_weight_arrays is not None:
+                os.makedirs(os.path.dirname(gt_weight_analysis_npz_path), exist_ok=True)
+                np.savez_compressed(gt_weight_analysis_npz_path, **gt_weight_arrays)
+        if pure_pnp_gt_soft_weight_mode != "none" and gt_weight_arrays is not None:
+            active_frame_data_list = build_weighted_frame_data_list(
+                active_frame_data_list,
+                gt_weight_arrays["learned_weight"],
+            )
+        if (
+            pure_pnp_single_frame_prefilter_min_inliers > 0
+            or pure_pnp_single_frame_prefilter_min_inlier_ratio > 0.0
+        ):
+            candidate_frames, single_frame_prefilter_diagnostics = filter_frame_data_by_single_frame_pnp_stability(
+                frame_data_list=active_frame_data_list,
+                rgb_camera=rgb_camera_model,
+                reproj_error=matcher_pnp_reproj_error,
+                iterations=matcher_pnp_iterations,
+                pnp_min_inliers=matcher_min_pnp_inliers,
+                keep_min_inliers=pure_pnp_single_frame_prefilter_min_inliers,
+                keep_min_inlier_ratio=pure_pnp_single_frame_prefilter_min_inlier_ratio,
+                gt_rvec=gt_rvec,
+                gt_tvec=gt_tvec,
+            )
+            if candidate_frames:
+                active_frame_data_list = candidate_frames
+                filtered_matches_total = int(sum(frame.points_3d.shape[0] for frame in active_frame_data_list))
+                filtered_init_frame_data_list = active_frame_data_list
+                if int(init_depth_strat_bins) > 1 and int(init_depth_strat_max_points_per_bin) > 0:
+                    filtered_init_frame_data_list = stratify_frame_data_by_depth(
+                        frame_data_list=active_frame_data_list,
+                        num_bins=int(init_depth_strat_bins),
+                        max_points_per_bin=int(init_depth_strat_max_points_per_bin),
+                    )
+                if filtered_init_frame_data_list:
+                    initial_rvec, initial_tvec = initialize_shared_extrinsic(
+                        frame_data_list=filtered_init_frame_data_list,
+                        rgb_camera=rgb_camera_model,
+                        reproj_error=matcher_pnp_reproj_error,
+                        iterations=matcher_pnp_iterations,
+                        min_inliers=matcher_min_pnp_inliers,
+                        filter_frames=False,
+                    )
+        apply_frame_filter = pure_pnp_frame_disagreement_mad_scale > 0.0
+        if pure_pnp_frame_disagreement_mad_scale > 0.0:
+            candidate_frames, frame_filter_diagnostics = filter_frame_data_by_pose_disagreement(
+                frame_data_list=active_frame_data_list,
+                rgb_camera=rgb_camera_model,
+                shared_rvec=initial_rvec,
+                shared_tvec=initial_tvec,
+                reproj_error=matcher_pnp_reproj_error,
+                iterations=matcher_pnp_iterations,
+                min_inliers=matcher_min_pnp_inliers,
+                mad_scale=pure_pnp_frame_disagreement_mad_scale,
+                min_keep_ratio=pure_pnp_frame_disagreement_min_keep_ratio,
+                min_keep_frames=pure_pnp_frame_disagreement_min_keep_frames,
+                gt_rvec=gt_rvec,
+                gt_tvec=gt_tvec,
+            )
+            dropped_frames = (
+                0
+                if not frame_filter_diagnostics
+                else int(frame_filter_diagnostics.get("dropped_frames", 0))
+            )
+            if (
+                pure_pnp_frame_disagreement_apply_max_dropped_frames > 0
+                and dropped_frames > pure_pnp_frame_disagreement_apply_max_dropped_frames
+            ):
+                apply_frame_filter = False
+                if frame_filter_diagnostics is not None:
+                    frame_filter_diagnostics["applied"] = False
+                    frame_filter_diagnostics["skip_reason"] = (
+                        "too_many_dropped_frames"
+                    )
+                    frame_filter_diagnostics["apply_max_dropped_frames"] = int(
+                        pure_pnp_frame_disagreement_apply_max_dropped_frames
+                    )
+            elif frame_filter_diagnostics is not None:
+                frame_filter_diagnostics["applied"] = True
+                frame_filter_diagnostics["apply_max_dropped_frames"] = int(
+                    pure_pnp_frame_disagreement_apply_max_dropped_frames
+                )
+            if candidate_frames and apply_frame_filter:
+                active_frame_data_list = candidate_frames
+                filtered_matches_total = int(sum(frame.points_3d.shape[0] for frame in active_frame_data_list))
+                filtered_init_frame_data_list = active_frame_data_list
+                if int(init_depth_strat_bins) > 1 and int(init_depth_strat_max_points_per_bin) > 0:
+                    filtered_init_frame_data_list = stratify_frame_data_by_depth(
+                        frame_data_list=active_frame_data_list,
+                        num_bins=int(init_depth_strat_bins),
+                        max_points_per_bin=int(init_depth_strat_max_points_per_bin),
+                    )
+                if filtered_init_frame_data_list:
+                    initial_rvec, initial_tvec = initialize_shared_extrinsic(
+                        frame_data_list=filtered_init_frame_data_list,
+                        rgb_camera=rgb_camera_model,
+                        reproj_error=matcher_pnp_reproj_error,
+                        iterations=matcher_pnp_iterations,
+                        min_inliers=matcher_min_pnp_inliers,
+                        filter_frames=False,
+                    )
+        if pure_pnp_residual_filter_mad_scale > 0.0 and not apply_frame_filter:
+            candidate_frames, filter_diagnostics = filter_frame_data_by_reprojection_consensus(
+                frame_data_list=active_frame_data_list,
+                rgb_camera=rgb_camera_model,
+                rvec=initial_rvec,
+                tvec=initial_tvec,
+                mad_scale=pure_pnp_residual_filter_mad_scale,
+                min_keep_ratio=pure_pnp_residual_filter_min_keep_ratio,
+                min_keep_per_frame=pure_pnp_residual_filter_min_keep_per_frame,
+                max_reproj_error=(
+                    pure_pnp_residual_filter_max_reproj_error
+                    if pure_pnp_residual_filter_max_reproj_error > 0.0
+                    else None
+                ),
+                gt_rvec=gt_rvec,
+                gt_tvec=gt_tvec,
+            )
+            if candidate_frames:
+                active_frame_data_list = candidate_frames
+                filtered_matches_total = int(sum(frame.points_3d.shape[0] for frame in active_frame_data_list))
+                filtered_init_frame_data_list = active_frame_data_list
+                if int(init_depth_strat_bins) > 1 and int(init_depth_strat_max_points_per_bin) > 0:
+                    filtered_init_frame_data_list = stratify_frame_data_by_depth(
+                        frame_data_list=active_frame_data_list,
+                        num_bins=int(init_depth_strat_bins),
+                        max_points_per_bin=int(init_depth_strat_max_points_per_bin),
+                    )
+                if filtered_init_frame_data_list:
+                    initial_rvec, initial_tvec = initialize_shared_extrinsic(
+                        frame_data_list=filtered_init_frame_data_list,
+                        rgb_camera=rgb_camera_model,
+                        reproj_error=matcher_pnp_reproj_error,
+                        iterations=matcher_pnp_iterations,
+                        min_inliers=matcher_min_pnp_inliers,
+                        filter_frames=False,
+                    )
         comparison = optimize_shared_extrinsic(
-            frame_data_list=frame_data_list,
+            frame_data_list=active_frame_data_list,
             rgb_camera=rgb_camera_model,
             initial_rvec=initial_rvec,
             initial_tvec=initial_tvec,
@@ -2125,10 +3268,61 @@ def _run_matcher_pose_update(
             photometric_residual_weight=temporal_photometric_weight,
             depth_residuals=depth_residuals,
             depth_target_maps=rendered_depth_maps,
+            depth_target_cameras=rendered_depth_cameras,
             depth_residual_weight=temporal_depth_weight,
+            optimize_rotation=pure_pnp_optimize_rotation,
+            optimize_translation=pure_pnp_optimize_translation,
+            solver_backend=pure_pnp_solver_backend,
+            gt_rvec=gt_rvec,
+            gt_tvec=gt_tvec,
+            gt_pose_residual_weight=pure_pnp_gt_pose_residual_weight,
         )
     except Exception as exc:
         return {"status": "failed", "reason": str(exc)}
+
+    if match_diagnostics_path is not None:
+        os.makedirs(os.path.dirname(match_diagnostics_path), exist_ok=True)
+        raw_frame_summaries = _summarize_frame_correspondences(
+            frame_data_list=frame_data_list,
+            rgb_camera=rgb_camera_model,
+            gt_rvec=gt_rvec,
+            gt_tvec=gt_tvec,
+            ref_rvec=initial_rvec,
+            ref_tvec=initial_tvec,
+        )
+        active_frame_summaries = _summarize_frame_correspondences(
+            frame_data_list=active_frame_data_list,
+            rgb_camera=rgb_camera_model,
+            gt_rvec=gt_rvec,
+            gt_tvec=gt_tvec,
+            ref_rvec=comparison.optimized.rotation_vector,
+            ref_tvec=comparison.optimized.translation,
+        )
+        payload = {
+            "raw_matches_total": raw_matches_total,
+            "filtered_matches_total": filtered_matches_total,
+            "frames_after_filter": int(comparison.optimized.frames_used),
+            "matches_after_opt": int(comparison.optimized.matches_used),
+            "mean_reproj_px": float(comparison.optimized.mean_reprojection_error),
+            "rotation_delta_deg": float(comparison.rotation_delta_deg),
+            "translation_delta_m": float(comparison.translation_delta_m),
+            "single_frame_prefilter": single_frame_prefilter_diagnostics,
+            "frame_disagreement_filter": frame_filter_diagnostics,
+            "consensus_filter": filter_diagnostics,
+            "shared_ransac_filter": shared_ransac_diagnostics,
+            "gt_reprojection_filter": gt_reproj_filter_diagnostics,
+            "gt_weight_learning": gt_weight_summary,
+            "gt_soft_weight_mode": str(pure_pnp_gt_soft_weight_mode),
+            "gt_soft_weight_translation_alpha": float(pure_pnp_gt_soft_weight_translation_alpha),
+            "gt_pose_residual_weight": float(pure_pnp_gt_pose_residual_weight),
+            "optimize_rotation": bool(pure_pnp_optimize_rotation),
+            "optimize_translation": bool(pure_pnp_optimize_translation),
+            "solver_backend": str(pure_pnp_solver_backend),
+            "raw_frame_summaries": raw_frame_summaries,
+            "active_frame_summaries": active_frame_summaries,
+        }
+        with open(match_diagnostics_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
 
     relative_rotation = comparison.optimized.rotation_matrix
     relative_translation = comparison.optimized.translation
@@ -2156,6 +3350,35 @@ def _run_matcher_pose_update(
         "temporal_blocks": int(len(temporal_residuals)),
         "photometric_blocks": int(len(photometric_residuals)),
         "depth_blocks": int(len(depth_residuals)),
+        "raw_matches_total": raw_matches_total,
+        "filtered_matches_total": filtered_matches_total,
+        "filter_dropped_matches": int(max(raw_matches_total - filtered_matches_total, 0)),
+        "filter_kept_ratio": float(filtered_matches_total / max(raw_matches_total, 1)),
+        "filter_gt_kept_median_px": (
+            None
+            if not filter_diagnostics
+            else filter_diagnostics.get("global_kept_gt_reproj", {}).get("median")
+        ),
+        "filter_gt_dropped_median_px": (
+            None
+            if not filter_diagnostics
+            else filter_diagnostics.get("global_dropped_gt_reproj", {}).get("median")
+        ),
+        "frame_filter_dropped_frames": (
+            0
+            if not frame_filter_diagnostics
+            else int(frame_filter_diagnostics.get("dropped_frames", 0))
+        ),
+        "lidar_nn_total_points": int(lidar_nn_total_points),
+        "lidar_nn_kept_points": int(lidar_nn_kept_points),
+        "lidar_nn_dropped_points": int(max(lidar_nn_total_points - lidar_nn_kept_points, 0)),
+        "lidar_nn_kept_ratio": float(lidar_nn_kept_points / max(lidar_nn_total_points, 1)),
+        "gt_weight_top_gt_reproj_median_px": (
+            None
+            if not gt_weight_summary
+            else gt_weight_summary.get("top_weight_summary", {}).get("gt_reproj_px", {}).get("median")
+        ),
+        "gt_soft_weight_mode": str(pure_pnp_gt_soft_weight_mode),
     }
 
 
@@ -2168,6 +3391,90 @@ _GAUSSIAN_ATTRS = [
     "_features_rgb_dc", "_features_rgb_rest",
     "_scaling", "_rotation", "_opacity",
 ]
+_GEOMETRY_ATTRS = ["_xyz", "_scaling", "_rotation"]
+
+
+def _collect_named_params(module, attrs: list[str]) -> list[tuple[str, torch.nn.Parameter]]:
+    named_params: list[tuple[str, torch.nn.Parameter]] = []
+    for attr in attrs:
+        param = getattr(module, attr, None)
+        if isinstance(param, torch.nn.Parameter) and param.requires_grad:
+            named_params.append((attr, param))
+    return named_params
+
+
+def _compute_named_grads(
+    loss: torch.Tensor,
+    named_params: list[tuple[str, torch.nn.Parameter]],
+) -> dict[str, torch.Tensor | None]:
+    grads = {attr: None for attr, _ in named_params}
+    if not torch.is_tensor(loss) or not bool(loss.requires_grad) or not named_params:
+        return grads
+    values = torch.autograd.grad(
+        loss,
+        [param for _, param in named_params],
+        retain_graph=True,
+        allow_unused=True,
+    )
+    for (attr, _), grad in zip(named_params, values):
+        if grad is not None:
+            grads[attr] = grad.detach().clone()
+    return grads
+
+
+def _accumulate_named_grads(
+    accum: dict[str, torch.Tensor | None],
+    grads: dict[str, torch.Tensor | None],
+    blocked_attrs: set[str] | None = None,
+) -> None:
+    blocked = blocked_attrs or set()
+    for attr, grad in grads.items():
+        if attr in blocked or grad is None:
+            continue
+        current = accum.get(attr)
+        accum[attr] = grad if current is None else (current + grad)
+
+
+def _merge_lidar_priority_geom_grads(
+    lidar_grads: dict[str, torch.Tensor | None],
+    camera_grads: dict[str, torch.Tensor | None],
+    camera_weight: float,
+) -> dict[str, torch.Tensor | None]:
+    merged: dict[str, torch.Tensor | None] = {}
+    for attr in set(lidar_grads.keys()) | set(camera_grads.keys()):
+        lidar_grad = lidar_grads.get(attr)
+        camera_grad = camera_grads.get(attr)
+        if lidar_grad is None and camera_grad is None:
+            merged[attr] = None
+            continue
+        if lidar_grad is None:
+            merged[attr] = float(camera_weight) * camera_grad
+            continue
+        if camera_grad is None:
+            merged[attr] = lidar_grad
+            continue
+        projected_camera = camera_grad
+        dot = torch.sum(lidar_grad * camera_grad)
+        if bool(dot < 0):
+            denom = torch.sum(lidar_grad * lidar_grad).clamp_min(1.0e-12)
+            projected_camera = camera_grad - (dot / denom) * lidar_grad
+        merged[attr] = lidar_grad + float(camera_weight) * projected_camera
+    return merged
+
+
+def _override_named_param_grads(
+    named_params: list[tuple[str, torch.nn.Parameter]],
+    grads: dict[str, torch.Tensor | None],
+) -> None:
+    for attr, param in named_params:
+        grad = grads.get(attr)
+        if grad is None:
+            continue
+        grad_value = grad.to(device=param.device, dtype=param.dtype)
+        if param.grad is None:
+            param.grad = grad_value.clone()
+        else:
+            param.grad.copy_(grad_value)
 
 
 def save_gaussian_state(gaussians) -> dict:
@@ -2261,6 +3568,32 @@ def _select_visualization_frames(cam_cameras: dict, scene, num_frames: int = 3) 
     return [chosen[i] for i in indices]
 
 
+def _select_lidar_visualization_frames(scene, num_frames: int = 3) -> list[int]:
+    lidar_sensor = getattr(scene, "train_lidar", None)
+    if lidar_sensor is None:
+        return []
+    frame_ids = sorted(int(k) for k in getattr(lidar_sensor, "train_frames", []))
+    if not frame_ids:
+        frame_ids = sorted(int(k) for k in getattr(lidar_sensor, "sensor2world", {}).keys())
+    if not frame_ids:
+        return []
+    if len(frame_ids) <= num_frames:
+        return frame_ids
+    indices = np.linspace(0, len(frame_ids) - 1, num_frames).round().astype(int)
+    return [frame_ids[i] for i in indices]
+
+
+def _depth_error_to_image(error_map: np.ndarray) -> np.ndarray:
+    error = np.asarray(error_map, dtype=np.float32)
+    valid = error > 0.0
+    if not np.any(valid):
+        return np.zeros((*error.shape, 3), dtype=np.uint8)
+    vmax = max(float(np.percentile(error[valid], 95.0)), 1.0e-6)
+    norm = np.clip(error / vmax, 0.0, 1.0)
+    encoded = (norm * 255.0).astype(np.uint8)
+    return cv2.applyColorMap(encoded, cv2.COLORMAP_INFERNO)
+
+
 @torch.no_grad()
 def _save_run_visualizations(
     out_dir: str,
@@ -2273,6 +3606,15 @@ def _save_run_visualizations(
     gt_l2c_T: torch.Tensor,
     args,
     matcher_name: str = "matchanything-roma",
+    matcher_minima_root: str | None = None,
+    matcher_minima_ckpt: str | None = None,
+    matcher_resize: int = 832,
+    matcher_match_threshold: float = 0.2,
+    matcher_render_intrinsics_fx_scale: float = 1.0,
+    matcher_render_intrinsics_fy_scale: float = 1.0,
+    matcher_render_intrinsics_cx_offset: float = 0.0,
+    matcher_render_intrinsics_cy_offset: float = 0.0,
+    matcher_lidar_nn_max_distance: float = 0.0,
     matcher_max_num_keypoints: int = 2048,
     matcher_ransac_reproj_thresh: float = 3.0,
     matcher_min_matches: int = 20,
@@ -2285,9 +3627,14 @@ def _save_run_visualizations(
     matcher_adjacent_support: bool = False,
     matcher_adjacent_max_offset: int = 1,
     matcher_support_radius_px: float = 6.0,
+    camera_aux_depth_render_backend: str = "3dgut_rasterization",
+    camera_aux_depth_mode: str = "median",
 ):
     viz_dir = os.path.join(out_dir, "visualizations")
     os.makedirs(viz_dir, exist_ok=True)
+    viz_depth_backend = _resolve_visualization_depth_backend(
+        camera_aux_depth_render_backend
+    )
 
     rot_err = _rotation_error_deg(_effective_R(pose_correction), gt_l2c_R)
     trans_err = _translation_error_m(pose_correction, gt_l2c_T)
@@ -2297,12 +3644,17 @@ def _save_run_visualizations(
 
     matcher = None
     temporal_support_cache: dict[int, np.ndarray] = {}
-    if matcher_name == "matchanything-roma":
+    if matcher_name in {"matchanything-roma", "minima-roma"}:
         try:
             matcher = build_matcher(
+                matcher_name=matcher_name,
                 device="cuda",
                 max_num_keypoints=int(matcher_max_num_keypoints),
                 ransac_reproj_thresh=float(matcher_ransac_reproj_thresh),
+                img_resize=int(matcher_resize),
+                match_threshold=float(matcher_match_threshold),
+                minima_root=matcher_minima_root,
+                minima_ckpt=matcher_minima_ckpt,
             )
         except Exception as exc:
             summary_lines = [f"matcher_visualization_skipped={exc}"]
@@ -2341,7 +3693,7 @@ def _save_run_visualizations(
             camera,
             [gaussians],
             args,
-            backend="3dgut_rasterization",
+            backend=viz_depth_backend,
             cam_rotation=cam_R.detach(),
             cam_translation=cam_T.detach(),
             require_rgb=False,
@@ -2358,7 +3710,8 @@ def _save_run_visualizations(
         frame_psnr = psnr(pred_rgb.permute(2, 0, 1), gt_rgb.permute(2, 0, 1)).item()
         gt_np = _to_uint8_rgb(gt_rgb)
         pred_np = _to_uint8_rgb(pred_rgb)
-        depth_np = depth_render["depth"].detach().squeeze(-1).cpu().numpy().astype(np.float32)
+        depth_tensor = _resolve_camera_aux_depth(depth_render, depth_mode=camera_aux_depth_mode)
+        depth_np = depth_tensor.detach().squeeze(-1).cpu().numpy().astype(np.float32)
         depth_vis = depth_to_match_image(
             depth_np,
             percentile_low=matcher_depth_percentile_low,
@@ -2423,8 +3776,9 @@ def _save_run_visualizations(
                 pred_samples, pred_valid = _sample_image_colors(pred_rgb, depth_points)
                 valid = gt_valid & pred_valid
                 if int(valid.sum().item()) >= int(matcher_min_depth_matches):
-                    rgb_points = rgb_points[valid.cpu().numpy()[gt_valid.cpu().numpy()]]
-                    depth_points = depth_points[valid.cpu().numpy()[pred_valid.cpu().numpy()]]
+                    valid_np = valid.cpu().numpy()
+                    rgb_points = rgb_points[valid_np]
+                    depth_points = depth_points[valid_np]
                     gt_samples = gt_samples[valid[gt_valid]]
                     sparse_target = _make_sparse_target_canvas(
                         gt_np.shape[:2],
@@ -2454,6 +3808,242 @@ def _save_run_visualizations(
 
     with open(os.path.join(viz_dir, "summary.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines) + "\n")
+
+
+@torch.no_grad()
+def _save_lidar_supervision_depth_visualizations(
+    out_dir: str,
+    gaussians,
+    scene,
+    args,
+    num_frames: int = 3,
+):
+    lidar_sensor = getattr(scene, "train_lidar", None)
+    if lidar_sensor is None:
+        return None
+    frame_ids = _select_lidar_visualization_frames(scene, num_frames=num_frames)
+    if not frame_ids:
+        return None
+
+    viz_dir = os.path.join(out_dir, "visualizations_lidar_supervision")
+    os.makedirs(viz_dir, exist_ok=True)
+    background = torch.tensor([0, 0, 1], device="cuda", dtype=torch.float32)
+    summary = []
+    panels = []
+
+    for frame in frame_ids:
+        gt_mask = lidar_sensor.get_mask(frame).cuda()
+        dyn_mask = lidar_sensor.get_dynamic_mask(frame).cuda()
+        static_mask = gt_mask & ~dyn_mask
+        if not torch.any(static_mask):
+            continue
+
+        gt_depth_map = lidar_sensor.get_depth(frame).cuda().float()
+        rays_o_valid, rays_d_valid, _ = lidar_sensor.get_valid_depth_rays(frame)
+        static_valid_mask = ~dyn_mask[gt_mask]
+        if not torch.any(static_valid_mask):
+            continue
+
+        sparse_sensor = (
+            rays_o_valid.unsqueeze(1),
+            rays_d_valid.unsqueeze(1),
+            lidar_sensor.sensor_center[frame].to(device="cuda", dtype=torch.float32),
+        )
+        sparse_render = raytracing(
+            frame,
+            [gaussians],
+            sparse_sensor,
+            background,
+            args,
+            depth_only=True,
+        )
+        sparse_pred_valid = sparse_render["depth"].reshape(-1)
+
+        dense_render = raytracing(
+            frame,
+            [gaussians],
+            lidar_sensor,
+            background,
+            args,
+            depth_only=True,
+        )
+        dense_pred_map = dense_render["depth"]
+        if dense_pred_map.ndim == 3:
+            dense_pred_map = dense_pred_map.squeeze(-1)
+        dense_pred_map = dense_pred_map.float()
+
+        sparse_pred_map = torch.zeros_like(gt_depth_map)
+        sparse_static_mask = torch.zeros_like(gt_mask, dtype=torch.bool)
+        sparse_static_mask[gt_mask] = static_valid_mask
+        sparse_pred_map[sparse_static_mask] = sparse_pred_valid[static_valid_mask]
+
+        abs_err = torch.abs(
+            sparse_pred_map[sparse_static_mask] - gt_depth_map[sparse_static_mask]
+        )
+        gt_depth_np = gt_depth_map.detach().cpu().numpy().astype(np.float32)
+        sparse_pred_np = sparse_pred_map.detach().cpu().numpy().astype(np.float32)
+        dense_pred_np = dense_pred_map.detach().cpu().numpy().astype(np.float32)
+        static_mask_np = sparse_static_mask.detach().cpu().numpy().astype(bool)
+        err_map_np = np.zeros_like(gt_depth_np, dtype=np.float32)
+        err_map_np[static_mask_np] = abs_err.detach().cpu().numpy().astype(np.float32)
+
+        gt_vis = depth_to_match_image(
+            np.where(static_mask_np, gt_depth_np, 0.0),
+            percentile_low=5.0,
+            percentile_high=95.0,
+            use_inverse=True,
+        )
+        pred_vis = depth_to_match_image(
+            np.where(static_mask_np, dense_pred_np, 0.0),
+            percentile_low=5.0,
+            percentile_high=95.0,
+            use_inverse=True,
+        )
+        err_vis = _depth_error_to_image(err_map_np)
+        panel = np.concatenate(
+            [
+                _add_label(gt_vis, f"GT LiDAR depth  frame={int(frame)}"),
+                _add_label(
+                    pred_vis,
+                    (
+                        "Rendered LiDAR depth  "
+                        f"gt_med={float(np.median(gt_depth_np[static_mask_np])):.2f}m  "
+                        f"pred_med={float(np.median(sparse_pred_np[static_mask_np])):.2f}m"
+                    ),
+                ),
+                _add_label(
+                    err_vis,
+                    (
+                        "Abs error  "
+                        f"med={float(np.median(err_map_np[static_mask_np])):.2f}m  "
+                        f"p95={float(np.percentile(err_map_np[static_mask_np], 95.0)):.2f}m"
+                    ),
+                ),
+            ],
+            axis=1,
+        )
+        panels.append(panel)
+        cv2.imwrite(os.path.join(viz_dir, f"frame_{int(frame):04d}.png"), panel)
+        summary.append(
+            {
+                "frame": int(frame),
+                "valid_pixels": int(static_mask_np.sum()),
+                "gt_depth_median": float(np.median(gt_depth_np[static_mask_np])),
+                "pred_depth_median": float(np.median(sparse_pred_np[static_mask_np])),
+                "dense_pred_depth_median": float(np.median(dense_pred_np[static_mask_np])),
+                "abs_err_mean": float(np.mean(err_map_np[static_mask_np])),
+                "abs_err_median": float(np.median(err_map_np[static_mask_np])),
+                "abs_err_p95": float(np.percentile(err_map_np[static_mask_np], 95.0)),
+            }
+        )
+
+    if panels:
+        overview = np.concatenate(panels, axis=0)
+        cv2.imwrite(os.path.join(viz_dir, "overview.png"), overview)
+    with open(os.path.join(viz_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    return viz_dir
+
+
+@torch.no_grad()
+def _save_gt_camera_depth_visualizations(
+    out_dir: str,
+    gaussians,
+    pose_correction,
+    cam_cameras: dict,
+    cam_images: dict,
+    scene,
+    gt_l2c_R: torch.Tensor,
+    gt_l2c_T: torch.Tensor,
+    args,
+    camera_aux_depth_render_backend: str = "3dgut_rasterization",
+    camera_aux_depth_mode: str = "median",
+    num_frames: int = 4,
+):
+    frame_ids = _select_visualization_frames(cam_cameras, scene, num_frames=num_frames)
+    if not frame_ids:
+        return None
+
+    viz_dir = os.path.join(out_dir, "visualizations_gt_camera_depth")
+    os.makedirs(viz_dir, exist_ok=True)
+    viz_depth_backend = _resolve_visualization_depth_backend(
+        camera_aux_depth_render_backend
+    )
+    summary = []
+    panels = []
+
+    for frame in frame_ids:
+        camera = cam_cameras[frame].cuda()
+        gt_rgb = cam_images[frame].cuda()
+        cam_R, cam_T = _camera_rt_from_lidar_to_camera(
+            pose_correction,
+            frame,
+            gt_l2c_R,
+            gt_l2c_T,
+            device="cuda",
+        )
+        depth_render = _render_camera_with_backend(
+            camera,
+            [gaussians],
+            args,
+            backend=viz_depth_backend,
+            cam_rotation=cam_R.detach(),
+            cam_translation=cam_T.detach(),
+            require_rgb=False,
+        )
+        depth_tensor = _resolve_camera_aux_depth(
+            depth_render,
+            depth_mode=camera_aux_depth_mode,
+        )
+        depth_np = depth_tensor.detach().squeeze(-1).cpu().numpy().astype(np.float32)
+        valid = depth_np > 0.0
+        gt_rgb_np = _to_uint8_rgb(gt_rgb)
+        depth_vis = depth_to_match_image(
+            depth_np,
+            percentile_low=5.0,
+            percentile_high=95.0,
+            use_inverse=True,
+        )
+        panel = np.concatenate(
+            [
+                _add_label(gt_rgb_np, f"GT RGB  frame={int(frame)}"),
+                _add_label(
+                    depth_vis,
+                    (
+                        "GT camera-view depth  "
+                        f"med={float(np.median(depth_np[valid])):.2f}m"
+                        if np.any(valid)
+                        else "GT camera-view depth  empty"
+                    ),
+                ),
+            ],
+            axis=1,
+        )
+        panels.append(panel)
+        cv2.imwrite(os.path.join(viz_dir, f"frame_{int(frame):04d}.png"), panel)
+        summary.append(
+            {
+                "frame": int(frame),
+                "valid_pixels": int(np.count_nonzero(valid)),
+                "pred_depth_median": (
+                    float(np.median(depth_np[valid]))
+                    if np.any(valid)
+                    else None
+                ),
+                "pred_depth_p95": (
+                    float(np.percentile(depth_np[valid], 95.0))
+                    if np.any(valid)
+                    else None
+                ),
+            }
+        )
+
+    if panels:
+        overview = np.concatenate(panels, axis=0)
+        cv2.imwrite(os.path.join(viz_dir, "overview.png"), overview)
+    with open(os.path.join(viz_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    return viz_dir
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2488,9 +4078,17 @@ def run_noise_inject_calib(
     lr_min: float = 1e-5,
     pose_lr_drop_cycle: int = 0,
     pose_lr_drop_factor: float = 0.1,
+    translation_lr_drop_cycle: int = 0,
+    translation_lr_drop_factor: float = 0.1,
     lambda_rgb: float = 1.0,
     lambda_depth: float = 1.0,
+    lambda_normal: float = 0.0,
     lambda_dssim: float = 0.2,
+    lambda_reg: float = 0.0,
+    geometry_conflict_policy: str = "none",
+    geometry_conflict_camera_weight: float = 1.0,
+    warmup_camera_depth_normal_weight: float = 0.0,
+    warmup_disable_other_regularizers: bool = False,
     initial_gaussian_state: dict = None,
     tb_writer=None,
     cycle_ckpt_dir: str = None,
@@ -2504,6 +4102,15 @@ def run_noise_inject_calib(
     matcher_update_interval: int = 1,
     matcher_update_blend: float = 1.0,
     matcher_name: str = "matchanything-roma",
+    matcher_minima_root: str | None = None,
+    matcher_minima_ckpt: str | None = None,
+    matcher_resize: int = 832,
+    matcher_match_threshold: float = 0.2,
+    matcher_render_intrinsics_fx_scale: float = 1.0,
+    matcher_render_intrinsics_fy_scale: float = 1.0,
+    matcher_render_intrinsics_cx_offset: float = 0.0,
+    matcher_render_intrinsics_cy_offset: float = 0.0,
+    matcher_lidar_nn_max_distance: float = 0.0,
     matcher_max_num_keypoints: int = 2048,
     matcher_min_matches: int = 20,
     matcher_min_depth_matches: int = 12,
@@ -2525,6 +4132,7 @@ def run_noise_inject_calib(
     post_init_supervision_blur_sigma: float = 0.0,
     post_init_supervision_blur_warmup_only: bool = False,
     freeze_gaussians_after_color_warmup: bool = False,
+    freeze_gaussians_after_cycle: int = 0,
     pose_step_at_cycle_end: bool = False,
     pose_step_interval_iters: int = 0,
     matcher_adjacent_support: bool = False,
@@ -2543,7 +4151,11 @@ def run_noise_inject_calib(
     cross_frame_weight: float = 0.0,
     flow_proj_weight: float = 0.0,
     flow_proj_max_offset: int = 1,
+    camera_aux_depth_render_backend: str = "3dgut_rasterization",
+    camera_aux_depth_mode: str = "median",
     pure_pnp_iters: int = 0,
+    pure_pnp_drop_first_n_frames: int = 0,
+    pure_pnp_drop_last_n_frames: int = 0,
     pure_pnp_photo_weight: float = 0.0,
     pure_pnp_photo_match_radius_px: float = 4.0,
     pure_pnp_photo_min_matches: int = 8,
@@ -2555,6 +4167,7 @@ def run_noise_inject_calib(
     pure_pnp_depth_match_radius_px: float = 4.0,
     pure_pnp_depth_min_matches: int = 8,
     pure_pnp_depth_render_backend: str = "3dgut_rasterization",
+    pure_pnp_depth_mode: str = "median",
     pure_pnp_temporal_semidense_stride: int = 0,
     pure_pnp_temporal_semidense_max_points: int = 0,
     pure_pnp_temporal_gradient_scale: float = 0.0,
@@ -2564,6 +4177,31 @@ def run_noise_inject_calib(
     pure_pnp_far_depth_start_percentile: float = 60.0,
     pure_pnp_post_init_rgb_blur_kernel: int = 0,
     pure_pnp_post_init_rgb_blur_sigma: float = 0.0,
+    periodic_pure_pnp_interval_cycles: int = 0,
+    disable_pose_grad_updates: bool = False,
+    pure_pnp_history_path: str | None = None,
+    pure_pnp_match_diagnostics_dir: str | None = None,
+    pure_pnp_residual_filter_mad_scale: float = 0.0,
+    pure_pnp_residual_filter_min_keep_ratio: float = 0.5,
+    pure_pnp_residual_filter_min_keep_per_frame: int = 24,
+    pure_pnp_residual_filter_max_reproj_error: float = 0.0,
+    pure_pnp_residual_filter_start_step: int = 1,
+    pure_pnp_single_frame_prefilter_min_inliers: int = 0,
+    pure_pnp_single_frame_prefilter_min_inlier_ratio: float = 0.0,
+    pure_pnp_frame_disagreement_mad_scale: float = 0.0,
+    pure_pnp_frame_disagreement_min_keep_ratio: float = 0.7,
+    pure_pnp_frame_disagreement_min_keep_frames: int = 12,
+    pure_pnp_frame_disagreement_apply_max_dropped_frames: int = 0,
+    pure_pnp_filter_shared_ransac_outliers: bool = False,
+    pure_pnp_gt_reproj_filter_quantile: float = 0.0,
+    pure_pnp_gt_reproj_filter_min_keep_per_frame: int = 24,
+    pure_pnp_gt_soft_weight_mode: str = "none",
+    pure_pnp_gt_soft_weight_translation_alpha: float = 0.5,
+    pure_pnp_gt_pose_residual_weight: float = 0.0,
+    pure_pnp_optimize_rotation: bool = True,
+    pure_pnp_optimize_translation: bool = True,
+    pure_pnp_solver_backend: str = "auto",
+    pure_pnp_gt_weight_analysis_dir: str | None = None,
 ):
     """Continuous calibration training loop.
 
@@ -2602,6 +4240,7 @@ def run_noise_inject_calib(
     cycle_coverage_rate: float = 0.0          # avg match coverage fraction from last precompute
     adj_gt_cache: dict[int, list] = {}         # precomputed adjacent GT colors, built once
     flow_proj_cache: dict[int, list] = {}      # precomputed RGB-RGB match pairs for flow proj, built once
+    pure_pnp_history: list[dict] = []
 
     def _apply_gaussian_freezes():
         """Freeze xyz and/or colors on the Gaussian + its Adam optimizer."""
@@ -2689,6 +4328,209 @@ def run_noise_inject_calib(
             blurred[frame_id] = torch.from_numpy(np.ascontiguousarray(blurred_np)).float()
         return blurred
 
+    def _flush_pure_pnp_history() -> None:
+        if pure_pnp_history_path is None:
+            return
+        out_dir = os.path.dirname(pure_pnp_history_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(pure_pnp_history_path, "w", encoding="utf-8") as f:
+            for row in pure_pnp_history:
+                f.write(json.dumps(row, ensure_ascii=True) + "\n")
+
+    def _record_pure_pnp_step(
+        phase: str,
+        cycle_value: int,
+        step_idx: int,
+        total_steps: int,
+        summary: dict,
+    ) -> dict:
+        eff_R = _effective_R(pose_correction)
+        rot_err = _rotation_error_deg(eff_R, gt_l2c_R)
+        trans_err = _translation_error_m(pose_correction, gt_l2c_T)
+        record = {
+            "phase": str(phase),
+            "cycle": int(cycle_value),
+            "step": int(step_idx),
+            "total_steps": int(total_steps),
+            "status": str(summary.get("status", "unknown")),
+            "reason": str(summary.get("reason", "")),
+            "rot_err_deg": float(rot_err),
+            "trans_err_m": float(trans_err),
+            "frames_used": int(summary.get("frames_used", 0)),
+            "matches_used": int(summary.get("matches_used", 0)),
+            "rotation_delta_deg": float(summary.get("rotation_delta_deg", 0.0)),
+            "translation_delta_m": float(summary.get("translation_delta_m", 0.0)),
+            "mean_reproj_px": float(summary.get("mean_reproj_px", 0.0)),
+            "flow_blocks": int(summary.get("temporal_blocks", 0)),
+            "depth_blocks": int(summary.get("depth_blocks", 0)),
+            "photo_blocks": int(summary.get("photometric_blocks", 0)),
+            "raw_matches_total": int(summary.get("raw_matches_total", summary.get("matches_used", 0))),
+            "filtered_matches_total": int(summary.get("filtered_matches_total", summary.get("matches_used", 0))),
+            "filter_dropped_matches": int(summary.get("filter_dropped_matches", 0)),
+            "filter_kept_ratio": float(summary.get("filter_kept_ratio", 1.0)),
+            "filter_gt_kept_median_px": summary.get("filter_gt_kept_median_px"),
+            "filter_gt_dropped_median_px": summary.get("filter_gt_dropped_median_px"),
+            "frame_filter_dropped_frames": int(summary.get("frame_filter_dropped_frames", 0)),
+        }
+        pure_pnp_history.append(record)
+        _flush_pure_pnp_history()
+        return record
+
+    def _run_pure_pnp_phase(
+        *,
+        phase: str,
+        cycle_value: int,
+        num_steps: int,
+    ) -> list[dict]:
+        if num_steps <= 0:
+            return []
+        print(
+            blue(
+                f"[PurePnP] Phase={phase} cycle={cycle_value} "
+                f"running {num_steps} iterative PnP steps..."
+            )
+        )
+        pure_pnp_frame_ids = sorted(cam_cameras.keys())
+        if pure_pnp_drop_first_n_frames > 0:
+            pure_pnp_frame_ids = pure_pnp_frame_ids[int(pure_pnp_drop_first_n_frames):]
+        if pure_pnp_drop_last_n_frames > 0:
+            keep_count = max(0, len(pure_pnp_frame_ids) - int(pure_pnp_drop_last_n_frames))
+            pure_pnp_frame_ids = pure_pnp_frame_ids[:keep_count]
+        if not pure_pnp_frame_ids:
+            raise ValueError(
+                "pure_pnp frame trimming removed all frames; "
+                "reduce --pure_pnp_drop_first_n_frames / --pure_pnp_drop_last_n_frames."
+            )
+        if pure_pnp_drop_first_n_frames > 0 or pure_pnp_drop_last_n_frames > 0:
+            print(
+                blue(
+                    "[PurePnP] Frame trimming enabled — "
+                    f"drop_first={pure_pnp_drop_first_n_frames}, "
+                    f"drop_last={pure_pnp_drop_last_n_frames}, "
+                    f"kept={len(pure_pnp_frame_ids)} frames "
+                    f"(range {pure_pnp_frame_ids[0]}..{pure_pnp_frame_ids[-1]})"
+                )
+            )
+        common = dict(
+            matcher=matcher,
+            gaussians=gaussians,
+            pose_correction=pose_correction,
+            cam_cameras=cam_cameras,
+            cam_images=cam_images,
+            camera_masks=camera_supervision_masks,
+            args=args,
+            frame_ids=pure_pnp_frame_ids,
+            matcher_min_matches=matcher_min_matches,
+            matcher_min_depth_matches=matcher_min_depth_matches,
+            matcher_min_pnp_inliers=matcher_min_pnp_inliers,
+            matcher_pnp_reproj_error=matcher_pnp_reproj_error,
+            matcher_pnp_iterations=matcher_pnp_iterations,
+            matcher_depth_min=matcher_depth_min,
+            matcher_depth_max=matcher_depth_max,
+            matcher_depth_percentile_low=matcher_depth_percentile_low,
+            matcher_depth_percentile_high=matcher_depth_percentile_high,
+            matcher_depth_use_inverse=matcher_depth_use_inverse,
+            render_intrinsics_fx_scale=matcher_render_intrinsics_fx_scale,
+            render_intrinsics_fy_scale=matcher_render_intrinsics_fy_scale,
+            render_intrinsics_cx_offset=matcher_render_intrinsics_cx_offset,
+            render_intrinsics_cy_offset=matcher_render_intrinsics_cy_offset,
+            matcher_lidar_nn_max_distance=matcher_lidar_nn_max_distance,
+            depth_render_backend=pure_pnp_depth_render_backend,
+            depth_render_mode=pure_pnp_depth_mode,
+            matcher_update_blend=1.0,
+            temporal_pair_cache=temporal_pair_cache,
+            temporal_photometric_weight=pure_pnp_photo_weight,
+            temporal_photometric_match_radius_px=pure_pnp_photo_match_radius_px,
+            temporal_photometric_min_matches=pure_pnp_photo_min_matches,
+            temporal_flow_weight=pure_pnp_flow_weight,
+            temporal_flow_match_radius_px=pure_pnp_flow_match_radius_px,
+            temporal_flow_min_matches=pure_pnp_flow_min_matches,
+            temporal_depth_weight=pure_pnp_depth_weight,
+            temporal_depth_match_radius_px=pure_pnp_depth_match_radius_px,
+            temporal_depth_min_matches=pure_pnp_depth_min_matches,
+            temporal_semidense_stride=pure_pnp_temporal_semidense_stride,
+            temporal_semidense_max_points=pure_pnp_temporal_semidense_max_points,
+            temporal_gradient_scale=pure_pnp_temporal_gradient_scale,
+            init_depth_strat_bins=pure_pnp_init_depth_strat_bins,
+            init_depth_strat_max_points_per_bin=pure_pnp_init_depth_strat_max_points_per_bin,
+            far_depth_boost=pure_pnp_far_depth_boost,
+            far_depth_start_percentile=pure_pnp_far_depth_start_percentile,
+            rgb_blur_kernel=pure_pnp_post_init_rgb_blur_kernel,
+            rgb_blur_sigma=pure_pnp_post_init_rgb_blur_sigma,
+            temporal_support_getter=get_temporal_support if matcher_adjacent_support else None,
+            temporal_support_radius_px=matcher_support_radius_px,
+            pure_pnp_residual_filter_mad_scale=pure_pnp_residual_filter_mad_scale,
+            pure_pnp_residual_filter_min_keep_ratio=pure_pnp_residual_filter_min_keep_ratio,
+            pure_pnp_residual_filter_min_keep_per_frame=pure_pnp_residual_filter_min_keep_per_frame,
+            pure_pnp_residual_filter_max_reproj_error=pure_pnp_residual_filter_max_reproj_error,
+            pure_pnp_single_frame_prefilter_min_inliers=pure_pnp_single_frame_prefilter_min_inliers,
+            pure_pnp_single_frame_prefilter_min_inlier_ratio=pure_pnp_single_frame_prefilter_min_inlier_ratio,
+            pure_pnp_frame_disagreement_mad_scale=pure_pnp_frame_disagreement_mad_scale,
+            pure_pnp_frame_disagreement_min_keep_ratio=pure_pnp_frame_disagreement_min_keep_ratio,
+            pure_pnp_frame_disagreement_min_keep_frames=pure_pnp_frame_disagreement_min_keep_frames,
+            pure_pnp_frame_disagreement_apply_max_dropped_frames=pure_pnp_frame_disagreement_apply_max_dropped_frames,
+            pure_pnp_filter_shared_ransac_outliers=pure_pnp_filter_shared_ransac_outliers,
+            pure_pnp_gt_reproj_filter_quantile=pure_pnp_gt_reproj_filter_quantile,
+            pure_pnp_gt_reproj_filter_min_keep_per_frame=pure_pnp_gt_reproj_filter_min_keep_per_frame,
+            pure_pnp_gt_soft_weight_mode=pure_pnp_gt_soft_weight_mode,
+            pure_pnp_gt_soft_weight_translation_alpha=pure_pnp_gt_soft_weight_translation_alpha,
+            pure_pnp_gt_pose_residual_weight=pure_pnp_gt_pose_residual_weight,
+            pure_pnp_optimize_rotation=pure_pnp_optimize_rotation,
+            pure_pnp_optimize_translation=pure_pnp_optimize_translation,
+            pure_pnp_solver_backend=pure_pnp_solver_backend,
+            gt_rotation_matrix=gt_l2c_R.detach().cpu().numpy(),
+            gt_translation=gt_l2c_T.detach().cpu().numpy(),
+        )
+        records: list[dict] = []
+        for pnp_i in range(1, num_steps + 1):
+            common["pure_pnp_residual_filter_mad_scale"] = (
+                pure_pnp_residual_filter_mad_scale
+                if int(pnp_i) >= int(max(pure_pnp_residual_filter_start_step, 1))
+                else 0.0
+            )
+            if pure_pnp_match_diagnostics_dir is not None:
+                common["match_diagnostics_path"] = os.path.join(
+                    pure_pnp_match_diagnostics_dir,
+                    f"{phase}_cycle{int(cycle_value):04d}_step{int(pnp_i):03d}.json",
+                )
+            if pure_pnp_gt_weight_analysis_dir is not None:
+                common["gt_weight_analysis_json_path"] = os.path.join(
+                    pure_pnp_gt_weight_analysis_dir,
+                    f"{phase}_cycle{int(cycle_value):04d}_step{int(pnp_i):03d}.json",
+                )
+                common["gt_weight_analysis_npz_path"] = os.path.join(
+                    pure_pnp_gt_weight_analysis_dir,
+                    f"{phase}_cycle{int(cycle_value):04d}_step{int(pnp_i):03d}.npz",
+                )
+            summary = _run_matcher_pose_update(**common)
+            record = _record_pure_pnp_step(
+                phase=phase,
+                cycle_value=cycle_value,
+                step_idx=pnp_i,
+                total_steps=num_steps,
+                summary=summary,
+            )
+            records.append(record)
+            if record["status"] == "applied":
+                print(
+                    blue(
+                        f"[PurePnP] {phase} step {pnp_i}/{num_steps} "
+                        f"rot_err={record['rot_err_deg']:.4f}°  "
+                        f"T_err={record['trans_err_m']:.4f}m  "
+                        f"frames={record['frames_used']} matches={record['matches_used']}  "
+                        f"dR={record['rotation_delta_deg']:.4f}° dT={record['translation_delta_m']:.4f}m"
+                    )
+                )
+            else:
+                print(
+                    blue(
+                        f"[PurePnP] {phase} step {pnp_i}/{num_steps} skipped: "
+                        f"{record['reason']}"
+                    )
+                )
+        return records
+
     camera_supervision_masks = {
         int(frame): _get_camera_supervision_mask(cam_cameras, frame)
         for frame in cam_cameras.keys()
@@ -2723,20 +4565,22 @@ def run_noise_inject_calib(
         _apply_matcher_color_lr_scale()
 
     if matcher_pose_update or matcher_color_supervision or matcher_adjacent_color_supervision or flow_proj_weight > 0 or pure_pnp_iters > 0 or initialize_pose_from_matcher:
-        if matcher_name != "matchanything-roma":
-            raise ValueError(
-                f"Matcher supervision currently expects matchanything-roma, got '{matcher_name}'."
-            )
         matcher = build_matcher(
+            matcher_name=matcher_name,
             device="cuda",
             max_num_keypoints=matcher_max_num_keypoints,
             ransac_reproj_thresh=matcher_ransac_reproj_thresh,
+            img_resize=matcher_resize,
+            match_threshold=matcher_match_threshold,
+            minima_root=matcher_minima_root,
+            minima_ckpt=matcher_minima_ckpt,
         )
-        # Warm up the 2DGS depth renderer (OptiX) BEFORE the matcher warmup.
-        # On Blackwell (cc12.0), OptiX compiles ray-tracing programs at first use,
-        # which can take 20-40 min.  Running one dummy render here forces compilation
-        # upfront so the precompute loop doesn't stall on frame 0.
-        print("[Renderer] Warming up 2DGS depth renderer (OptiX JIT)...")
+        # Warm up the camera-side auxiliary depth renderer BEFORE matcher use.
+        # This avoids backend-specific first-use stalls from blocking frame 0.
+        print(
+            f"[Renderer] Warming up camera auxiliary depth renderer "
+            f"({camera_aux_depth_render_backend})..."
+        )
         _warmup_frame = next(
             (f for f in frame_ids_train if f in cam_cameras and f in cam_images),
             None,
@@ -2747,8 +4591,10 @@ def run_noise_inject_calib(
                 _wu_camera = cam_cameras[_warmup_frame].cuda()
                 with torch.no_grad():
                     _render_camera_with_backend(
-                        _wu_camera, [gaussians], args,
-                        backend="3dgut_rasterization",
+                        _wu_camera,
+                        [gaussians],
+                        args,
+                        backend=camera_aux_depth_render_backend,
                         cam_rotation=_wu_cam_R.detach(),
                         cam_translation=_wu_cam_T.detach(),
                     )
@@ -2833,6 +4679,17 @@ def run_noise_inject_calib(
                     f"gradient_scale={pure_pnp_temporal_gradient_scale:.2f}"
                 )
             )
+        if (
+            pure_pnp_single_frame_prefilter_min_inliers > 0
+            or pure_pnp_single_frame_prefilter_min_inlier_ratio > 0.0
+        ):
+            print(
+                blue(
+                    "[PurePnP] Single-frame PnP stability prefilter enabled — "
+                    f"min_inliers={pure_pnp_single_frame_prefilter_min_inliers}, "
+                    f"min_inlier_ratio={pure_pnp_single_frame_prefilter_min_inlier_ratio:.2f}"
+                )
+            )
         if pure_pnp_init_depth_strat_bins > 1 and pure_pnp_init_depth_strat_max_points_per_bin > 0:
             print(
                 blue(
@@ -2852,6 +4709,26 @@ def run_noise_inject_calib(
                 blue(
                     "[PurePnP] Post-init RGB blur enabled — "
                     f"kernel={pure_pnp_post_init_rgb_blur_kernel}, sigma={pure_pnp_post_init_rgb_blur_sigma:.2f}"
+                )
+            )
+        if pure_pnp_residual_filter_mad_scale > 0.0:
+            print(
+                blue(
+                    "[PurePnP] Consensus residual trimming enabled — "
+                    f"mad_scale={pure_pnp_residual_filter_mad_scale:.2f}, "
+                    f"min_keep_ratio={pure_pnp_residual_filter_min_keep_ratio:.2f}, "
+                    f"min_keep_per_frame={pure_pnp_residual_filter_min_keep_per_frame}, "
+                    f"start_step={pure_pnp_residual_filter_start_step}"
+                )
+            )
+        if pure_pnp_frame_disagreement_mad_scale > 0.0:
+            print(
+                blue(
+                    "[PurePnP] Frame-disagreement filtering enabled — "
+                    f"mad_scale={pure_pnp_frame_disagreement_mad_scale:.2f}, "
+                    f"min_keep_ratio={pure_pnp_frame_disagreement_min_keep_ratio:.2f}, "
+                    f"min_keep_frames={pure_pnp_frame_disagreement_min_keep_frames}, "
+                    f"apply_max_dropped_frames={pure_pnp_frame_disagreement_apply_max_dropped_frames}"
                 )
             )
         if flow_proj_weight > 0.0 or pure_pnp_photo_weight > 0.0 or pure_pnp_flow_weight > 0.0 or pure_pnp_depth_weight > 0.0:
@@ -2879,10 +4756,33 @@ def run_noise_inject_calib(
         print(blue("[NoiseInject] Full-image camera RGB loss updates POSE only"))
     if freeze_translation:
         print(blue("[NoiseInject] Translation FROZEN — keep initialized translation fixed during training"))
+    if warmup_cycles > 0:
+        print(blue(f"[NoiseInject] LiDAR warmup enabled for first {warmup_cycles} cycles (camera-side supervision disabled, pose frozen)"))
     if color_warmup_cycles > 0:
         print(blue(f"[NoiseInject] Color warmup enabled for first {color_warmup_cycles} cycles (RGB losses update colors only)"))
     if disable_depth_during_color_warmup:
         print(blue("[NoiseInject] LiDAR depth supervision disabled during color warmup"))
+    if geometry_conflict_policy != "none":
+        print(
+            blue(
+                "[NoiseInject] Geometry conflict handling enabled — "
+                f"policy={geometry_conflict_policy}, camera_weight={geometry_conflict_camera_weight:.2f}"
+            )
+        )
+    if (
+        matcher_pose_update
+        or matcher_color_supervision
+        or matcher_adjacent_color_supervision
+        or flow_proj_weight > 0.0
+        or pure_pnp_iters > 0
+        or initialize_pose_from_matcher
+    ):
+        print(
+            blue(
+                "[Renderer] Camera auxiliary depth backend: "
+                f"{camera_aux_depth_render_backend} | mode: {camera_aux_depth_mode}"
+            )
+        )
     if matcher_adjacent_support:
         print(blue(f"[NoiseInject] Adjacent-frame RGB support enabled (offset={matcher_adjacent_max_offset}, radius={matcher_support_radius_px:.1f}px)"))
     if post_warmup_rgb_reg_scale > 0:
@@ -2925,7 +4825,14 @@ def run_noise_inject_calib(
             matcher_depth_percentile_low=matcher_depth_percentile_low,
             matcher_depth_percentile_high=matcher_depth_percentile_high,
             matcher_depth_use_inverse=matcher_depth_use_inverse,
+            render_intrinsics_fx_scale=matcher_render_intrinsics_fx_scale,
+            render_intrinsics_fy_scale=matcher_render_intrinsics_fy_scale,
+            render_intrinsics_cx_offset=matcher_render_intrinsics_cx_offset,
+            render_intrinsics_cy_offset=matcher_render_intrinsics_cy_offset,
+            matcher_lidar_nn_max_distance=matcher_lidar_nn_max_distance,
             matcher_update_blend=1.0,
+            depth_render_backend=camera_aux_depth_render_backend,
+            depth_render_mode=camera_aux_depth_mode,
             temporal_support_getter=get_temporal_support,
             temporal_support_radius_px=matcher_support_radius_px,
         )
@@ -2961,95 +4868,65 @@ def run_noise_inject_calib(
                 )
             )
 
-    # ── Pure iterative PnP (no Gaussian training) ─────────────
-    if pure_pnp_iters > 0:
-        print(blue(f"[PurePnP] Running {pure_pnp_iters} pure iterative PnP steps (no Gaussian training)..."))
-        _pnp_common = dict(
-            matcher=matcher,
-            gaussians=gaussians,
-            pose_correction=pose_correction,
-            cam_cameras=cam_cameras,
-            cam_images=cam_images,
-            camera_masks=camera_supervision_masks,
-            args=args,
-            frame_ids=sorted(cam_cameras.keys()),
-            matcher_min_matches=matcher_min_matches,
-            matcher_min_depth_matches=matcher_min_depth_matches,
-            matcher_min_pnp_inliers=matcher_min_pnp_inliers,
-            matcher_pnp_reproj_error=matcher_pnp_reproj_error,
-            matcher_pnp_iterations=matcher_pnp_iterations,
-            matcher_depth_min=matcher_depth_min,
-            matcher_depth_max=matcher_depth_max,
-            matcher_depth_percentile_low=matcher_depth_percentile_low,
-            matcher_depth_percentile_high=matcher_depth_percentile_high,
-            matcher_depth_use_inverse=matcher_depth_use_inverse,
-            depth_render_backend=pure_pnp_depth_render_backend,
-            matcher_update_blend=1.0,
-            temporal_pair_cache=temporal_pair_cache,
-            temporal_photometric_weight=pure_pnp_photo_weight,
-            temporal_photometric_match_radius_px=pure_pnp_photo_match_radius_px,
-            temporal_photometric_min_matches=pure_pnp_photo_min_matches,
-            temporal_flow_weight=pure_pnp_flow_weight,
-            temporal_flow_match_radius_px=pure_pnp_flow_match_radius_px,
-            temporal_flow_min_matches=pure_pnp_flow_min_matches,
-            temporal_depth_weight=pure_pnp_depth_weight,
-            temporal_depth_match_radius_px=pure_pnp_depth_match_radius_px,
-            temporal_depth_min_matches=pure_pnp_depth_min_matches,
-            temporal_semidense_stride=pure_pnp_temporal_semidense_stride,
-            temporal_semidense_max_points=pure_pnp_temporal_semidense_max_points,
-            temporal_gradient_scale=pure_pnp_temporal_gradient_scale,
-            init_depth_strat_bins=pure_pnp_init_depth_strat_bins,
-            init_depth_strat_max_points_per_bin=pure_pnp_init_depth_strat_max_points_per_bin,
-            far_depth_boost=pure_pnp_far_depth_boost,
-            far_depth_start_percentile=pure_pnp_far_depth_start_percentile,
-            rgb_blur_kernel=pure_pnp_post_init_rgb_blur_kernel,
-            rgb_blur_sigma=pure_pnp_post_init_rgb_blur_sigma,
-            temporal_support_getter=get_temporal_support if matcher_adjacent_support else None,
-            temporal_support_radius_px=matcher_support_radius_px,
+    if periodic_pure_pnp_interval_cycles > 0 and pure_pnp_iters <= 0:
+        raise ValueError(
+            "periodic_pure_pnp_interval_cycles requires pure_pnp_iters > 0 "
+            "so an initial pure PnP phase can be run before training."
         )
-        for _pnp_i in range(1, pure_pnp_iters + 1):
-            _s = _run_matcher_pose_update(**_pnp_common)
-            eff_R   = _effective_R(pose_correction)
-            rot_err = _rotation_error_deg(eff_R, gt_l2c_R)
-            T_err   = _translation_error_m(pose_correction, gt_l2c_T)
-            if _s["status"] == "applied":
-                print(blue(
-                    f"[PurePnP] iter {_pnp_i}/{pure_pnp_iters}  "
-                    f"rot_err={rot_err:.4f}°  T_err={T_err:.4f}m  "
-                    f"frames={_s['frames_used']} matches={_s['matches_used']} "
-                    f"dR={_s['rotation_delta_deg']:.4f}° dT={_s['translation_delta_m']:.4f}m "
-                    f"flow_blocks={_s.get('temporal_blocks', 0)} "
-                    f"depth_blocks={_s.get('depth_blocks', 0)} "
-                    f"photo_blocks={_s.get('photometric_blocks', 0)}"
-                ))
-            else:
-                print(blue(f"[PurePnP] iter {_pnp_i}/{pure_pnp_iters}  skipped: {_s['reason']}"))
-        print(blue(f"[PurePnP] Done. Final rot_err={_rotation_error_deg(_effective_R(pose_correction), gt_l2c_R):.4f}°"))
-        return _effective_R(pose_correction)  # exit without training
+    if periodic_pure_pnp_interval_cycles > 0 and matcher_pose_update:
+        raise ValueError(
+            "periodic_pure_pnp_interval_cycles cannot be combined with matcher_pose_update; "
+            "choose one pose-update schedule."
+        )
+    if periodic_pure_pnp_interval_cycles > 0:
+        print(
+            blue(
+                "[PurePnP] Periodic schedule enabled — "
+                f"initial_steps={pure_pnp_iters}, interval={periodic_pure_pnp_interval_cycles} cycles, "
+                f"disable_pose_grad_updates={disable_pose_grad_updates}"
+            )
+        )
+    if pure_pnp_iters > 0:
+        print(blue(f"[PurePnP] Shared extrinsic solver backend: {pure_pnp_solver_backend}"))
+    if pure_pnp_iters > 0 and (not pure_pnp_optimize_rotation or not pure_pnp_optimize_translation):
+        mode_bits = []
+        if pure_pnp_optimize_rotation:
+            mode_bits.append("rotation")
+        if pure_pnp_optimize_translation:
+            mode_bits.append("translation")
+        print(blue(f"[PurePnP] Shared extrinsic optimization mode: {'+'.join(mode_bits)}"))
+
+    run_initial_pure_pnp_after_warmup = bool(pure_pnp_iters > 0)
 
 
     optimizer_param_groups = []
-    if not freeze_rotation:
-        optimizer_param_groups.append(
-            {"params": [pose_correction.delta_rotations_quat], "lr": rotation_lr}
-        )
-    if not pose_correction.use_gt_translation and not two_stage and not freeze_translation:
-        optimizer_param_groups.append(
-            {"params": [pose_correction.delta_translations], "lr": translation_lr}
-        )
-    if not optimizer_param_groups:
-        raise ValueError("No parameters to optimize: both rotation and translation are frozen.")
-    pose_optimizer = torch.optim.Adam(optimizer_param_groups)
-
-    # ── ReduceLROnPlateau for pose rotation ───────────────────
-    pose_lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        pose_optimizer,
-        mode="min",
-        factor=lr_factor,
-        patience=lr_patience,
-        min_lr=lr_min,
-        threshold=1e-3,
-    ) if lr_patience > 0 else None
+    if not disable_pose_grad_updates:
+        if not freeze_rotation:
+            optimizer_param_groups.append(
+                {"params": [pose_correction.delta_rotations_quat], "lr": rotation_lr, "name": "rotation"}
+            )
+        if not pose_correction.use_gt_translation and not two_stage and not freeze_translation:
+            optimizer_param_groups.append(
+                {"params": [pose_correction.delta_translations], "lr": translation_lr, "name": "translation"}
+            )
+        if optimizer_param_groups:
+            pose_optimizer = torch.optim.Adam(optimizer_param_groups)
+            pose_lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                pose_optimizer,
+                mode="min",
+                factor=lr_factor,
+                patience=lr_patience,
+                min_lr=lr_min,
+                threshold=1e-3,
+            ) if lr_patience > 0 else None
+        else:
+            pose_optimizer = None
+            pose_lr_scheduler = None
+            print(blue("[NoiseInject] Pose optimizer disabled — both rotation and translation updates are frozen"))
+    else:
+        pose_optimizer = None
+        pose_lr_scheduler = None
+        print(blue("[NoiseInject] Pose gradient updates DISABLED — pose will only change via pure PnP"))
 
     init_R   = _effective_R(pose_correction)
     init_err = _rotation_error_deg(init_R, gt_l2c_R)
@@ -3066,8 +4943,12 @@ def run_noise_inject_calib(
         print(blue(f"[NoiseInject] Pose optimizer steps and folds extrinsics every {pose_step_interval_iters} iterations"))
     if freeze_gaussians_after_color_warmup:
         print(blue("[NoiseInject] Gaussian scene will be frozen after color warmup; later cycles optimize pose only"))
+    if freeze_gaussians_after_cycle > 0:
+        print(blue(f"[NoiseInject] Gaussian scene will be frozen after cycle {freeze_gaussians_after_cycle}; later cycles optimize pose only"))
     if pose_lr_drop_cycle > 0:
         print(blue(f"[NoiseInject] Late-stage pose LR drop enabled — cycle {pose_lr_drop_cycle} × {pose_lr_drop_factor:.3f}"))
+    if translation_lr_drop_cycle > 0:
+        print(blue(f"[NoiseInject] Late-stage translation LR drop enabled — cycle {translation_lr_drop_cycle} × {translation_lr_drop_factor:.3f}"))
     if disable_depth_after_cycle > 0:
         print(blue(f"[NoiseInject] Depth supervision disabled after cycle {disable_depth_after_cycle}"))
 
@@ -3088,11 +4969,13 @@ def run_noise_inject_calib(
     loss_match_adjacent_accum = 0.0
     loss_cross_frame_accum = 0.0
     loss_flow_proj_accum = 0.0
+    loss_reg_accum = 0.0
     # Best-T tracking: save the delta_T that achieved the lowest T_err
     best_T_err     = float("inf")
     best_delta_T   = pose_correction.delta_translations.data.clone()
     start_cycle    = 1
     pose_lr_drop_applied = False
+    translation_lr_drop_applied = False
 
     # ── Resume from cycle checkpoint ──────────────────────────
     if resume_ckpt is not None and not resume_cycle_ckpt_scene_only:
@@ -3129,15 +5012,18 @@ def run_noise_inject_calib(
                         if cparam is not None and any(p is cparam for p in pg["params"]):
                             pg["lr"] = 0.0
                 stage2_desc = "xyz+colors FROZEN"
-            print(blue(f"[NoiseInject] Stage 2 activated at cycle {cycle}: {stage2_desc}, translation optimizer added"))
-            pose_optimizer.add_param_group(
-                {"params": [pose_correction.delta_translations], "lr": translation_lr}
-            )
-            if pose_lr_scheduler is not None:
-                pose_lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    pose_optimizer, mode="min", factor=lr_factor,
-                    patience=lr_patience, min_lr=lr_min, threshold=1e-3,
+            if pose_optimizer is not None:
+                print(blue(f"[NoiseInject] Stage 2 activated at cycle {cycle}: {stage2_desc}, translation optimizer added"))
+                pose_optimizer.add_param_group(
+                    {"params": [pose_correction.delta_translations], "lr": translation_lr, "name": "translation"}
                 )
+                if pose_lr_scheduler is not None:
+                    pose_lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                        pose_optimizer, mode="min", factor=lr_factor,
+                        patience=lr_patience, min_lr=lr_min, threshold=1e-3,
+                    )
+            else:
+                print(blue(f"[NoiseInject] Stage 2 activated at cycle {cycle}: {stage2_desc}, pose gradients remain disabled"))
 
         if (
             freeze_gaussians_after_color_warmup
@@ -3150,7 +5036,39 @@ def run_noise_inject_calib(
             gaussians.optimizer.zero_grad(set_to_none=True)
             print(blue(f"[NoiseInject] Gaussian scene frozen after color warmup at cycle {cycle} — pose-only refinement from here"))
 
+        if (
+            freeze_gaussians_after_cycle > 0
+            and not freeze_gaussians
+            and cycle > freeze_gaussians_after_cycle
+        ):
+            freeze_gaussians = True
+            _apply_gaussian_freezes()
+            gaussians.optimizer.zero_grad(set_to_none=True)
+            print(blue(f"[NoiseInject] Gaussian scene frozen after cycle {freeze_gaussians_after_cycle} at cycle {cycle} — pose-only refinement from here"))
+
+        if _should_run_initial_pure_pnp(
+            run_pending=run_initial_pure_pnp_after_warmup,
+            cycle=cycle,
+            warmup_cycles=warmup_cycles,
+            total_cycles=total_cycles,
+        ):
+            _run_pure_pnp_phase(
+                phase="initial",
+                cycle_value=max(int(warmup_cycles), 0),
+                num_steps=pure_pnp_iters,
+            )
+            print(
+                blue(
+                    f"[PurePnP] Initial phase done after warmup. "
+                    f"rot_err={_rotation_error_deg(_effective_R(pose_correction), gt_l2c_R):.4f}°"
+                )
+            )
+            run_initial_pure_pnp_after_warmup = False
+            if periodic_pure_pnp_interval_cycles <= 0:
+                return _effective_R(pose_correction)
+
         # ── Per-cycle match precomputation ────────────────────
+        lidar_warmup_active = bool(warmup_cycles > 0 and cycle <= warmup_cycles)
         warmup_active_now = bool(color_warmup_cycles > 0 and cycle <= color_warmup_cycles)
         if blurred_cam_images is not None:
             current_cam_images = (
@@ -3162,9 +5080,14 @@ def run_noise_inject_calib(
                 print(blue("[NoiseInject] Color warmup finished — switching supervision back to original RGB"))
         pose_grad_accum_steps = 0
         pose_interval_accum_steps = 0
-        if pose_step_at_cycle_end:
+        if pose_step_at_cycle_end and pose_optimizer is not None:
             pose_optimizer.zero_grad(set_to_none=True)
-        if match_once_per_cycle and matcher is not None and matcher_color_supervision:
+        if (
+            match_once_per_cycle
+            and matcher is not None
+            and matcher_color_supervision
+            and not lidar_warmup_active
+        ):
             cycle_match_cache, cycle_coverage_rate = _precompute_cycle_match_cache(
                 matcher=matcher,
                 gaussians=gaussians,
@@ -3187,13 +5110,20 @@ def run_noise_inject_calib(
                 dense_stride=matcher_dense_stride,
                 dense_cert_threshold=matcher_dense_cert_threshold,
                 dense_color_cert_threshold=matcher_dense_color_cert_threshold,
+                depth_render_backend=camera_aux_depth_render_backend,
+                depth_render_mode=camera_aux_depth_mode,
             )
             if cycle_coverage_rate > 0.0:
                 scale = 1.0 if warmup_active_now else 0.3
                 print(f"[Cycle cache] GT RGB lambda = {cycle_coverage_rate:.3f} × {scale} = {cycle_coverage_rate*scale:.4f}")
 
         # Build adjacent GT color cache lazily (GT images never change, only needs to run once)
-        if matcher_adjacent_color_supervision and temporal_pair_cache and not adj_gt_cache:
+        if (
+            matcher_adjacent_color_supervision
+            and temporal_pair_cache
+            and not adj_gt_cache
+            and not lidar_warmup_active
+        ):
             adj_gt_cache = _precompute_adjacent_gt_cache(
                 temporal_pair_cache,
                 current_cam_images,
@@ -3217,31 +5147,110 @@ def run_noise_inject_calib(
             # appear in the LiDAR raytracing path, so this render provides no
             # pose gradient and only wastes compute.
             loss_depth = torch.tensor(0.0, device="cuda")
+            loss_normal = torch.tensor(0.0, device="cuda")
             depth_active = (
                 not freeze_gaussians
                 and (disable_depth_after_cycle <= 0 or cycle <= disable_depth_after_cycle)
                 and not (disable_depth_during_color_warmup and color_warmup_active)
             )
             if depth_active:
-                render_pkg = raytracing(
-                    frame, [gaussians], scene.train_lidar, background, args, depth_only=True
-                )
-                depth       = render_pkg["depth"].squeeze(-1)
-                gt_mask     = scene.train_lidar.get_mask(frame).cuda()
-                dyn_mask    = scene.train_lidar.get_dynamic_mask(frame).cuda()
-                static_mask = gt_mask & ~dyn_mask
-                gt_depth    = scene.train_lidar.get_depth(frame).cuda()
-                if torch.any(static_mask):
-                    loss_depth = lambda_depth * l1_loss(depth[static_mask], gt_depth[static_mask])
+                gt_mask = scene.train_lidar.get_mask(frame).cuda()
+                dyn_mask = scene.train_lidar.get_dynamic_mask(frame).cuda()
+                if torch.any(gt_mask):
+                    rays_o_valid, rays_d_valid, gt_depth_valid = scene.train_lidar.get_valid_depth_rays(frame)
+                    static_valid_mask = ~dyn_mask[gt_mask]
+                    if torch.any(static_valid_mask):
+                        sparse_sensor = (
+                            rays_o_valid.unsqueeze(1),
+                            rays_d_valid.unsqueeze(1),
+                            scene.train_lidar.sensor_center[frame].to(device="cuda", dtype=torch.float32),
+                        )
+                        render_pkg = raytracing(
+                            frame,
+                            [gaussians],
+                            sparse_sensor,
+                            background,
+                            args,
+                            depth_only=True,
+                        )
+                        pred_depth = render_pkg["depth"].reshape(-1)
+                        pred_accum = render_pkg.get("accumulation")
+                        if pred_accum is not None:
+                            pred_accum = pred_accum.reshape(-1)
+                        pred_normal = render_pkg.get("normal")
+                        if pred_normal is not None:
+                            pred_normal = pred_normal.reshape(-1, 3)
+                        sparse_static_mask = torch.zeros_like(gt_mask, dtype=torch.bool)
+                        sparse_static_mask[gt_mask] = static_valid_mask
+                        sparse_pred_map = torch.zeros_like(scene.train_lidar.get_depth(frame).cuda().float())
+                        sparse_pred_map[sparse_static_mask] = pred_depth[static_valid_mask]
+                        loss_depth = lambda_depth * _compute_lidar_depth_loss(
+                            pred_depth=pred_depth[static_valid_mask],
+                            gt_depth=gt_depth_valid[static_valid_mask],
+                            accumulation=(
+                                None
+                                if pred_accum is None
+                                else pred_accum[static_valid_mask]
+                            ),
+                            loss_mode=str(
+                                getattr(args.opt, "lidar_depth_loss_mode", "l1")
+                            ),
+                            inverse_min_depth=float(
+                                getattr(args.opt, "lidar_depth_inverse_min_depth", 0.5)
+                            ),
+                            use_visibility_weights=bool(
+                                getattr(args.opt, "lidar_depth_use_image_visibility_weights", False)
+                            ),
+                            visible_weight=float(
+                                getattr(args.opt, "lidar_depth_visible_weight", 2.0)
+                            ),
+                            occluded_weight=float(
+                                getattr(args.opt, "lidar_depth_occluded_weight", 0.5)
+                            ),
+                            outside_weight=float(
+                                getattr(args.opt, "lidar_depth_outside_weight", 1.0)
+                            ),
+                            visibility_tolerance=float(
+                                getattr(args.opt, "lidar_depth_visibility_tolerance", 0.25)
+                            ),
+                        )
+                        if float(lambda_normal) > 0.0:
+                            pred_support_mask = sparse_static_mask.clone()
+                            if pred_accum is not None:
+                                pred_support_mask[sparse_static_mask] = (
+                                    pred_accum[static_valid_mask] > 1.0e-4
+                                )
+                            gt_normal_map, gt_normal_valid = scene.train_lidar.get_normal(frame)
+                            gt_normal_map = gt_normal_map.cuda().float()
+                            gt_normal_valid = gt_normal_valid.cuda()
+                            pred_normal_map = torch.zeros(
+                                (*gt_mask.shape, 3),
+                                device=gt_mask.device,
+                                dtype=torch.float32,
+                            )
+                            if pred_normal is not None:
+                                pred_normal_map[sparse_static_mask] = pred_normal[static_valid_mask]
+                            normal_valid_mask = (
+                                _four_neighbor_support_mask(pred_support_mask)
+                                & _four_neighbor_support_mask(~dyn_mask)
+                                & gt_normal_valid
+                            )
+                            loss_normal = float(lambda_normal) * _compute_lidar_normal_loss(
+                                pred_normal_map=pred_normal_map,
+                                gt_normal_map=gt_normal_map,
+                                valid_mask=normal_valid_mask,
+                            )
 
             # ── Camera RGB loss ───────────────────────────────
             loss_rgb = torch.tensor(0.0, device="cuda")
             loss_match_color = torch.tensor(0.0, device="cuda")
             loss_match_adjacent = torch.tensor(0.0, device="cuda")
             loss_rgb_reg = torch.tensor(0.0, device="cuda")
+            loss_reg = torch.tensor(0.0, device="cuda")
+            loss_camera_depth_normal = torch.tensor(0.0, device="cuda")
             matcher_color_summary = None
             base_rgb_photo_loss = None
-            if frame in cam_cameras:
+            if frame in cam_cameras and not lidar_warmup_active:
                 cam_R, cam_T = pose_correction.corrected_rt(frame, device="cuda")
                 camera  = cam_cameras[frame].cuda()
                 gt_rgb  = current_cam_images[frame].cuda()
@@ -3300,7 +5309,7 @@ def run_noise_inject_calib(
                             camera,
                             [gaussians],
                             args,
-                            backend="3dgut_rasterization",
+                            backend=camera_aux_depth_render_backend,
                             cam_rotation=cam_R.detach(),
                             cam_translation=cam_T.detach(),
                             require_rgb=False,
@@ -3314,11 +5323,15 @@ def run_noise_inject_calib(
                             require_rgb=True,
                         )
                         if int(depth_render.get("num_visible", 0)) > 0 and int(color_render.get("num_visible", 0)) > 0:
+                            aux_depth = _resolve_camera_aux_depth(
+                                depth_render,
+                                depth_mode=camera_aux_depth_mode,
+                            )
                             loss_match_color, matcher_color_summary = _compute_matcher_color_loss(
                                 matcher=matcher,
                                 gt_rgb=gt_rgb,
                                 pred_rgb=color_render["rgb"].clamp(0.0, 1.0),
-                                depth=depth_render["depth"],
+                                depth=aux_depth,
                                 matcher_min_matches=matcher_min_matches,
                                 matcher_min_depth_matches=matcher_min_depth_matches,
                                 matcher_depth_min=matcher_depth_min,
@@ -3374,7 +5387,53 @@ def run_noise_inject_calib(
                             adjacent_color_weight=matcher_adjacent_color_weight,
                         )
 
-            total_loss = loss_depth + loss_rgb + loss_match_color + loss_match_adjacent + loss_rgb_reg
+            if (
+                lidar_warmup_active
+                and float(warmup_camera_depth_normal_weight) > 0.0
+                and frame in cam_cameras
+            ):
+                cam_R_reg, cam_T_reg = pose_correction.corrected_rt(frame, device="cuda")
+                camera_reg = cam_cameras[frame].cuda()
+                camera_depth_render = _render_camera_with_backend(
+                    camera_reg,
+                    [gaussians],
+                    args,
+                    backend="raytracing",
+                    cam_rotation=cam_R_reg.detach(),
+                    cam_translation=cam_T_reg.detach(),
+                    require_rgb=False,
+                )
+                if int(camera_depth_render.get("num_visible", 0)) > 0:
+                    camera_depth = _resolve_camera_aux_depth(
+                        camera_depth_render,
+                        depth_mode="depth",
+                    )
+                    camera_normal = camera_depth_render.get("normal")
+                    if camera_normal is not None:
+                        loss_camera_depth_normal = (
+                            float(warmup_camera_depth_normal_weight)
+                            * _compute_camera_depth_normal_consistency_loss(
+                                pred_depth_map=camera_depth,
+                                pred_normal_map=camera_normal,
+                                camera=camera_reg,
+                            )
+                        )
+
+            apply_other_regularizers = not (
+                lidar_warmup_active and bool(warmup_disable_other_regularizers)
+            )
+            if apply_other_regularizers and float(lambda_reg) > 0.0:
+                reg_term = gaussians.box_reg_loss()
+                if not torch.is_tensor(reg_term):
+                    reg_term = torch.tensor(float(reg_term), device=loss_depth.device, dtype=loss_depth.dtype)
+                else:
+                    reg_term = reg_term.to(device=loss_depth.device, dtype=loss_depth.dtype)
+                loss_reg = float(lambda_reg) * reg_term
+            if apply_other_regularizers and loss_normal.numel() > 0:
+                loss_reg = loss_reg + loss_normal
+            loss_reg = loss_reg + loss_camera_depth_normal
+
+            total_loss = loss_depth + loss_rgb + loss_match_color + loss_match_adjacent + loss_rgb_reg + loss_reg
 
             # ── Cross-frame photometric consistency loss ──────────────────────────
             loss_cross_frame = torch.tensor(0.0, device="cuda")
@@ -3420,13 +5479,16 @@ def run_noise_inject_calib(
                 cam_R_fp, cam_T_fp = pose_correction.corrected_rt(frame, device="cuda")
                 _fp_surfel = _render_camera_with_backend(
                     _cam_fp.cuda(), [gaussians], args,
-                    backend="3dgut_rasterization",
+                    backend=camera_aux_depth_render_backend,
                     cam_rotation=cam_R_fp.detach(),
                     cam_translation=cam_T_fp.detach(),
                     require_rgb=False,
                 )
                 if _fp_surfel.get("num_visible", 0) > 0 and "depth" in _fp_surfel:
-                    _depth_fp = _fp_surfel["depth"]
+                    _depth_fp = _resolve_camera_aux_depth(
+                        _fp_surfel,
+                        depth_mode=camera_aux_depth_mode,
+                    )
                     if _depth_fp.dim() == 3:
                         _depth_fp = _depth_fp.squeeze(-1)
                     loss_flow_proj = _compute_flow_projection_loss(
@@ -3441,12 +5503,61 @@ def run_noise_inject_calib(
                         cy=_cy_fp,
                         weight=flow_proj_weight,
                     )
+                merged_geometry_grads = None
+                geometry_named_params = []
                 # Selectively gate RGB gradients on Gaussian parameters, then add LiDAR depth grads.
                 rgb_zero_attrs = []
                 retain_graph_for_rgb = bool(loss_match_color.requires_grad or loss_match_adjacent.requires_grad or loss_rgb_reg.requires_grad)
+                lidar_loss = loss_depth + loss_reg
+                if geometry_conflict_policy == "lidar_priority" and not freeze_gaussians:
+                    geometry_named_params = _collect_named_params(gaussians, _GEOMETRY_ATTRS)
+                    if geometry_named_params:
+                        lidar_geometry_grads = _compute_named_grads(lidar_loss, geometry_named_params)
+                        camera_geometry_grads = {
+                            attr: None for attr, _ in geometry_named_params
+                        }
+                        if loss_rgb.requires_grad:
+                            rgb_blocked_attrs = set()
+                            if color_warmup_active:
+                                rgb_blocked_attrs.update(_MATCH_FROZEN_ATTRS)
+                            elif camera_rgb_pose_only:
+                                rgb_blocked_attrs.update(_GEOMETRY_ATTRS)
+                            else:
+                                if freeze_covariance:
+                                    rgb_blocked_attrs.update(["_scaling", "_rotation"])
+                                if rgb_only_updates_color:
+                                    rgb_blocked_attrs.update(_RGB_FROZEN_ATTRS)
+                            _accumulate_named_grads(
+                                camera_geometry_grads,
+                                _compute_named_grads(loss_rgb, geometry_named_params),
+                                blocked_attrs=rgb_blocked_attrs,
+                            )
+                        if loss_match_color.requires_grad:
+                            _accumulate_named_grads(
+                                camera_geometry_grads,
+                                _compute_named_grads(loss_match_color, geometry_named_params),
+                                blocked_attrs=set(_MATCH_FROZEN_ATTRS),
+                            )
+                        if loss_match_adjacent.requires_grad:
+                            _accumulate_named_grads(
+                                camera_geometry_grads,
+                                _compute_named_grads(loss_match_adjacent, geometry_named_params),
+                                blocked_attrs=set(_MATCH_FROZEN_ATTRS),
+                            )
+                        if loss_rgb_reg.requires_grad:
+                            _accumulate_named_grads(
+                                camera_geometry_grads,
+                                _compute_named_grads(loss_rgb_reg, geometry_named_params),
+                                blocked_attrs=set(_MATCH_FROZEN_ATTRS),
+                            )
+                        merged_geometry_grads = _merge_lidar_priority_geom_grads(
+                            lidar_grads=lidar_geometry_grads,
+                            camera_grads=camera_geometry_grads,
+                            camera_weight=geometry_conflict_camera_weight,
+                        )
                 if loss_rgb.requires_grad:
                     if color_warmup_active:
-                        # During warmup: RGB loss updates colors + covariance + opacity, but NOT xyz
+                        # During color warmup: RGB loss updates colors + covariance + opacity, but NOT xyz
                         rgb_zero_attrs = _MATCH_FROZEN_ATTRS
                     elif camera_rgb_pose_only:
                         rgb_zero_attrs = list(_GAUSSIAN_ATTRS)
@@ -3481,19 +5592,22 @@ def run_noise_inject_calib(
                         p = getattr(gaussians, attr, None)
                         if p is not None and p.grad is not None:
                             p.grad.zero_()
-                if loss_depth.requires_grad:
-                    loss_depth.backward()
+                if lidar_loss.requires_grad:
+                    lidar_loss.backward()
                 # Cross-frame loss: pred_rgb is detached → no Gaussian grads, only pose grads
                 if loss_cross_frame.requires_grad:
                     loss_cross_frame.backward()
                 # Flow projection loss: depth is detached → only pose grads
                 if loss_flow_proj.requires_grad:
                     loss_flow_proj.backward()
+                if merged_geometry_grads is not None:
+                    _override_named_param_grads(geometry_named_params, merged_geometry_grads)
             else:
                 (total_loss + loss_cross_frame + loss_flow_proj).backward()
             loss_accum       += total_loss.item() + loss_cross_frame.item() + loss_flow_proj.item()
             loss_depth_accum += loss_depth.item()
             loss_rgb_accum   += loss_rgb.item()
+            loss_reg_accum   += float(loss_reg.detach())
             loss_match_color_accum += loss_match_color.item()
             loss_match_adjacent_accum += loss_match_adjacent.item()
             loss_cross_frame_accum += loss_cross_frame.item()
@@ -3503,7 +5617,9 @@ def run_noise_inject_calib(
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
 
-            if pose_step_at_cycle_end:
+            if pose_optimizer is None:
+                pose_correction.zero_grad(set_to_none=True)
+            elif pose_step_at_cycle_end:
                 if cycle > warmup_cycles and not matcher_pose_update and not color_warmup_active:
                     pose_grad_accum_steps += 1
             else:
@@ -3523,7 +5639,9 @@ def run_noise_inject_calib(
 
         # ── Fold delta into base once per cycle ────────────────
         matcher_update_summary = None
-        if pose_step_at_cycle_end:
+        if pose_optimizer is None:
+            pose_correction.zero_grad(set_to_none=True)
+        elif pose_step_at_cycle_end:
             if cycle > warmup_cycles and not matcher_pose_update and cycle > color_warmup_cycles and pose_grad_accum_steps > 0:
                 grad_scale = 1.0 / float(pose_grad_accum_steps)
                 for pg in pose_optimizer.param_groups:
@@ -3557,10 +5675,26 @@ def run_noise_inject_calib(
                 matcher_depth_percentile_low=matcher_depth_percentile_low,
                 matcher_depth_percentile_high=matcher_depth_percentile_high,
                 matcher_depth_use_inverse=matcher_depth_use_inverse,
+                render_intrinsics_fx_scale=matcher_render_intrinsics_fx_scale,
+                render_intrinsics_fy_scale=matcher_render_intrinsics_fy_scale,
+                render_intrinsics_cx_offset=matcher_render_intrinsics_cx_offset,
+                render_intrinsics_cy_offset=matcher_render_intrinsics_cy_offset,
+                matcher_lidar_nn_max_distance=matcher_lidar_nn_max_distance,
                 matcher_update_blend=matcher_update_blend,
                 temporal_support_getter=get_temporal_support,
                 temporal_support_radius_px=matcher_support_radius_px,
             )
+        elif (
+            periodic_pure_pnp_interval_cycles > 0
+            and cycle % periodic_pure_pnp_interval_cycles == 0
+        ):
+            periodic_records = _run_pure_pnp_phase(
+                phase="periodic",
+                cycle_value=cycle,
+                num_steps=pure_pnp_iters,
+            )
+            if periodic_records:
+                matcher_update_summary = periodic_records[-1]
         elif cycle > warmup_cycles and cycle > color_warmup_cycles and pose_step_interval_iters <= 0:
             pose_correction.update_extrinsics()
 
@@ -3585,6 +5719,7 @@ def run_noise_inject_calib(
         avg_loss  = loss_accum       / iters_per_cycle
         avg_depth = loss_depth_accum / iters_per_cycle
         avg_rgb   = loss_rgb_accum   / iters_per_cycle
+        avg_reg   = loss_reg_accum   / iters_per_cycle
         avg_match_color = loss_match_color_accum / iters_per_cycle
         avg_match_adjacent = loss_match_adjacent_accum / iters_per_cycle
         avg_cross_frame = loss_cross_frame_accum / iters_per_cycle
@@ -3594,6 +5729,7 @@ def run_noise_inject_calib(
         loss_accum       = 0.0
         loss_depth_accum = 0.0
         loss_rgb_accum   = 0.0
+        loss_reg_accum   = 0.0
         loss_match_color_accum = 0.0
         loss_match_adjacent_accum = 0.0
         loss_cross_frame_accum = 0.0
@@ -3608,15 +5744,32 @@ def run_noise_inject_calib(
             pose_lr_drop_cycle > 0
             and not pose_lr_drop_applied
             and cycle >= pose_lr_drop_cycle
+            and pose_optimizer is not None
         ):
             for pg in pose_optimizer.param_groups:
                 pg["lr"] = max(float(lr_min), float(pg["lr"]) * float(pose_lr_drop_factor))
             pose_lr_drop_applied = True
             print(blue(f"  [LR] late-stage pose LR drop applied at cycle {cycle}: ×{pose_lr_drop_factor:.3f}"))
 
+        if (
+            translation_lr_drop_cycle > 0
+            and not translation_lr_drop_applied
+            and cycle >= translation_lr_drop_cycle
+            and pose_optimizer is not None
+        ):
+            translation_lr_updated = False
+            for pg in pose_optimizer.param_groups:
+                if pg.get("name") != "translation":
+                    continue
+                pg["lr"] = max(float(lr_min), float(pg["lr"]) * float(translation_lr_drop_factor))
+                translation_lr_updated = True
+            if translation_lr_updated:
+                translation_lr_drop_applied = True
+                print(blue(f"  [LR] late-stage translation LR drop applied at cycle {cycle}: ×{translation_lr_drop_factor:.3f}"))
+
         # ── ReduceLROnPlateau step ────────────────────────────
-        cur_rot_lr = pose_optimizer.param_groups[0]["lr"]
-        if pose_lr_scheduler is not None and cycle > warmup_cycles:
+        cur_rot_lr = pose_optimizer.param_groups[0]["lr"] if pose_optimizer is not None else 0.0
+        if pose_lr_scheduler is not None and pose_optimizer is not None and cycle > warmup_cycles:
             pose_lr_scheduler.step(rot_err)
             new_rot_lr = pose_optimizer.param_groups[0]["lr"]
             if new_rot_lr < cur_rot_lr:
@@ -3629,13 +5782,14 @@ def run_noise_inject_calib(
             f"  Cycle {cycle:3d}/{total_cycles}  rot_err={rot_err:.4f}°  "
             f"T_err={T_err:.4f}m  "
             f"PSNR={avg_psnr:.2f} dB  loss={avg_loss:.5f}  "
-            f"[d={avg_depth:.4f}  rgb={avg_rgb:.4f}  match_rgb={avg_match_color:.4f}  adj_rgb={avg_match_adjacent:.4f}{_cf_str}{_fp_str}]  lr={cur_rot_lr:.2e}"
+            f"[d={avg_depth:.4f}  reg={avg_reg:.4f}  rgb={avg_rgb:.4f}  match_rgb={avg_match_color:.4f}  adj_rgb={avg_match_adjacent:.4f}{_cf_str}{_fp_str}]  lr={cur_rot_lr:.2e}"
         ))
         if matcher_update_summary is not None:
+            summary_tag = str(matcher_update_summary.get("phase", "matcher"))
             if matcher_update_summary["status"] == "applied":
                 print(
                     blue(
-                        "    [matcher] "
+                        f"    [{summary_tag}] "
                         f"frames={matcher_update_summary['frames_used']}  "
                         f"matches={matcher_update_summary['matches_used']}  "
                         f"reproj={matcher_update_summary['mean_reproj_px']:.3f}px  "
@@ -3644,7 +5798,7 @@ def run_noise_inject_calib(
                     )
                 )
             else:
-                print(blue(f"    [matcher] skipped: {matcher_update_summary['reason']}"))
+                print(blue(f"    [{summary_tag}] skipped: {matcher_update_summary['reason']}"))
 
         if tb_writer is not None:
             tb_writer.add_scalar("calib/rot_err_deg",  rot_err,  cycle)
@@ -3652,6 +5806,7 @@ def run_noise_inject_calib(
             tb_writer.add_scalar("calib/psnr_db",      avg_psnr, cycle)
             tb_writer.add_scalar("calib/loss",         avg_loss, cycle)
             tb_writer.add_scalar("calib/loss_depth",   avg_depth, cycle)
+            tb_writer.add_scalar("calib/loss_reg",     avg_reg, cycle)
             tb_writer.add_scalar("calib/loss_rgb",     avg_rgb,  cycle)
             tb_writer.add_scalar("calib/loss_match_color", avg_match_color, cycle)
             tb_writer.add_scalar("calib/loss_match_adjacent", avg_match_adjacent, cycle)
@@ -3661,6 +5816,7 @@ def run_noise_inject_calib(
                 tb_writer.add_scalar("calib/matcher_reproj_px", matcher_update_summary["mean_reproj_px"], cycle)
                 tb_writer.add_scalar("calib/matcher_rotation_delta_deg", matcher_update_summary["rotation_delta_deg"], cycle)
                 tb_writer.add_scalar("calib/matcher_translation_delta_m", matcher_update_summary["translation_delta_m"], cycle)
+            tb_writer.flush()
 
         # ── Cycle checkpoint ──────────────────────────────────
         if (cycle_ckpt_dir is not None
@@ -3760,7 +5916,7 @@ def main():
     parser.add_argument("--stage2_keep_colors_trainable", action="store_true",
                         help="When using --translation_start_cycle, keep Gaussian color features trainable during stage 2 instead of freezing them.")
     parser.add_argument("--warmup_cycles",         type=int, default=0,
-                        help="Freeze pose optimizer for this many cycles at the start. Default: 0.")
+                        help="Run pure LiDAR/depth warmup for this many cycles at the start: pose frozen, camera-side supervision disabled. Default: 0.")
     parser.add_argument("--freeze_rotation",       action="store_true",
                         help="Freeze rotation, optimise translation only.")
     parser.add_argument("--freeze_translation",    action="store_true",
@@ -3775,6 +5931,10 @@ def main():
                         help="If >0, multiply pose learning rates once at this cycle for late-stage refinement.")
     parser.add_argument("--pose_lr_drop_factor",  type=float, default=0.1,
                         help="Multiplicative factor for the one-time late-stage pose LR drop.")
+    parser.add_argument("--translation_lr_drop_cycle", type=int, default=0,
+                        help="If >0, multiply only translation LR once at this cycle for late-stage refinement.")
+    parser.add_argument("--translation_lr_drop_factor", type=float, default=0.1,
+                        help="Multiplicative factor for the one-time late-stage translation LR drop.")
     parser.add_argument("--use_gt_translation",  action="store_true",
                         help="Lock translation to GT (skip translation optimisation).")
     parser.add_argument("--translation_lr",      type=float, default=0.0015,
@@ -3800,11 +5960,19 @@ def main():
                         help="For camera RGB supervision, zero Gaussian grads on everything "
                              "except color features. Pose gradients are kept.")
     parser.add_argument("--matcher_pose_update", action="store_true",
-                        help="Update pose once per cycle from matchanything-roma RGB-vs-rendered-depth calibration.")
+                        help="Update pose once per cycle from RGB-vs-rendered-depth matcher calibration.")
     parser.add_argument("--pure_pnp_iters", type=int, default=0,
-                        help="Run N pure iterative PnP steps (render depth → match → PnP, no Gaussian training) then exit.")
+                        help="Run N pure iterative PnP steps (render depth → match → PnP). By default this exits immediately after the PnP phase; when --periodic_pure_pnp_interval_cycles > 0, these N steps become the initial pose update before training continues.")
+    parser.add_argument("--pure_pnp_drop_first_n_frames", type=int, default=0,
+                        help="For pure PnP only: drop this many earliest frames from the shared-extrinsic solve.")
+    parser.add_argument("--pure_pnp_drop_last_n_frames", type=int, default=0,
+                        help="For pure PnP only: drop this many latest frames from the shared-extrinsic solve.")
+    parser.add_argument("--periodic_pure_pnp_interval_cycles", type=int, default=0,
+                        help="If >0, after the initial pure PnP phase, rerun pure PnP every N training cycles instead of only once.")
+    parser.add_argument("--disable_pose_grad_updates", action="store_true",
+                        help="Disable pose gradient optimization during training. Pose is only updated by matcher / pure PnP schedules.")
     parser.add_argument("--matcher_color_supervision", action="store_true",
-                        help="Use matchanything-roma correspondences to map GT RGB colors onto rendered depth pixels for sparse color supervision.")
+                        help="Use matcher correspondences to map GT RGB colors onto rendered depth pixels for sparse color supervision.")
     parser.add_argument("--matcher_color_weight", type=float, default=1.0,
                         help="Weight for sparse matcher color supervision.")
     parser.add_argument("--camera_rgb_pose_only", action="store_true",
@@ -3821,6 +5989,8 @@ def main():
                         help="Apply post-init supervision blur only during color warmup cycles, then switch back to original RGB supervision.")
     parser.add_argument("--freeze_gaussians_after_color_warmup", action="store_true",
                         help="Freeze the full Gaussian scene after color warmup finishes so later cycles optimize pose only.")
+    parser.add_argument("--freeze_gaussians_after_cycle", type=int, default=0,
+                        help="If >0, freeze the full Gaussian scene after this cycle so later cycles optimize pose only.")
     parser.add_argument("--pose_step_at_cycle_end", action="store_true",
                         help="Accumulate pose gradients within a cycle and update pose once at the end of that cycle.")
     parser.add_argument("--pose_step_interval_iters", type=int, default=0,
@@ -3844,7 +6014,25 @@ def main():
     parser.add_argument("--matcher_update_blend", type=float, default=None,
                         help="Blend factor for each matcher pose update. Defaults to pose_correction.matcher_update_blend.")
     parser.add_argument("--matcher_name", default=None,
-                        help="Matcher backend for cycle pose update. Currently only matchanything-roma is supported.")
+                        help="Matcher backend for cycle pose update. Supports matchanything-roma and minima-roma.")
+    parser.add_argument("--matcher_minima_root", type=str, default=None,
+                        help="Optional MINIMA repo root for matcher_name=minima-roma.")
+    parser.add_argument("--matcher_minima_ckpt", type=str, default=None,
+                        help="Optional MINIMA RoMa checkpoint path for matcher_name=minima-roma.")
+    parser.add_argument("--matcher_resize", type=int, default=None,
+                        help="Matcher input resize before feature extraction.")
+    parser.add_argument("--matcher_match_threshold", type=float, default=None,
+                        help="MatchAnything coarse match threshold.")
+    parser.add_argument("--matcher_render_intrinsics_fx_scale", type=float, default=None,
+                        help="Render-only focal scale on fx for matcher/PurePnP depth rendering.")
+    parser.add_argument("--matcher_render_intrinsics_fy_scale", type=float, default=None,
+                        help="Render-only focal scale on fy for matcher/PurePnP depth rendering.")
+    parser.add_argument("--matcher_render_intrinsics_cx_offset", type=float, default=None,
+                        help="Render-only principal-point x offset in pixels for matcher/PurePnP depth rendering.")
+    parser.add_argument("--matcher_render_intrinsics_cy_offset", type=float, default=None,
+                        help="Render-only principal-point y offset in pixels for matcher/PurePnP depth rendering.")
+    parser.add_argument("--matcher_lidar_nn_max_distance", type=float, default=None,
+                        help="If >0, drop backprojected depth 3D points whose nearest LiDAR-point distance exceeds this threshold in meters.")
     parser.add_argument("--matcher_max_num_keypoints", type=int, default=None)
     parser.add_argument("--matcher_min_matches", type=int, default=None)
     parser.add_argument("--matcher_dense_mode", action="store_true",
@@ -3873,8 +6061,37 @@ def main():
     parser.add_argument("--lambda_depth",           type=float, default=None,
                         help="Override the depth loss weight (default from exp config, "
                              "usually 1.0). Set to 0 to disable depth supervision entirely.")
+    parser.add_argument("--lambda_normal",          type=float, default=None,
+                        help="Override the LiDAR depth-normal consistency weight. Defaults to exp config lambda_normal.")
     parser.add_argument("--lambda_rgb",             type=float, default=None,
                         help="Override the full-image camera RGB loss weight. Set to 0 to disable dense RGB supervision.")
+    parser.add_argument("--lambda_dssim",           type=float, default=None,
+                        help="Override the RGB DSSIM mixing weight. Defaults to exp config lambda_rgb_dssim.")
+    parser.add_argument("--lambda_reg",             type=float, default=None,
+                        help="Override the Gaussian box regularization weight. Defaults to exp config lambda_reg.")
+    parser.add_argument("--geometry_conflict_policy", type=str, default="none",
+                        choices=["none", "lidar_priority"],
+                        help="How to merge conflicting geometry gradients between LiDAR supervision and camera/RGB supervision.")
+    parser.add_argument("--geometry_conflict_camera_weight", type=float, default=1.0,
+                        help="Relative weight kept on camera geometry gradients after LiDAR-priority conflict projection.")
+    parser.add_argument("--warmup_camera_depth_normal_weight", type=float, default=0.0,
+                        help="During LiDAR warmup, add a camera-view depth/normal consistency regularizer from raytraced camera depth and rendered normals. 0 = disabled.")
+    parser.add_argument("--warmup_disable_other_regularizers", action="store_true",
+                        help="During LiDAR warmup, disable the existing box and LiDAR-normal regularizers so only LiDAR depth plus the camera-view depth/normal term remain.")
+    parser.add_argument("--lidar_depth_use_image_visibility_weights", action="store_true",
+                        help="Use lidar-rt-style visibility weighting for LiDAR depth supervision.")
+    parser.add_argument("--lidar_depth_visible_weight", type=float, default=None,
+                        help="Weight for visible LiDAR depth residuals when visibility weighting is enabled.")
+    parser.add_argument("--lidar_depth_occluded_weight", type=float, default=None,
+                        help="Weight for occluded/back-surface LiDAR depth residuals when visibility weighting is enabled.")
+    parser.add_argument("--lidar_depth_outside_weight", type=float, default=None,
+                        help="Weight for no-hit/outside LiDAR depth residuals when visibility weighting is enabled.")
+    parser.add_argument("--lidar_depth_visibility_tolerance", type=float, default=None,
+                        help="Absolute depth tolerance (meters) for visibility-weighted LiDAR depth supervision.")
+    parser.add_argument("--lidar_depth_loss_mode", type=str, default=None, choices=["l1", "inverse_depth"],
+                        help="LiDAR depth supervision residual: absolute depth (l1) or inverse depth.")
+    parser.add_argument("--lidar_depth_inverse_min_depth", type=float, default=None,
+                        help="Clamp predicted and GT depth to at least this many meters before inverse-depth supervision.")
     parser.add_argument("--matcher_color_lr_scale", type=float, default=1.0,
                         help="Multiply optimizer learning rates for camera RGB feature params when using matcher color supervision.")
     parser.add_argument("--cross_frame_weight",  type=float, default=0.0,
@@ -3889,6 +6106,16 @@ def main():
                              "Gradient flows only through pose params (depth detached). 0 = off.")
     parser.add_argument("--flow_proj_max_offset", type=int, default=1,
                         help="Max frame offset for flow projection pairs (default 1 = ±1 neighbor).")
+    parser.add_argument("--camera_aux_depth_render_backend", type=str, default=None,
+                        choices=["3dgut_rasterization", "surfel_rasterization", "raytracing", "lidar_zbuffer", "lidar_scanline_zbuffer", "point_zbuffer"],
+                        help="Backend used for camera-side auxiliary depth renders such as matcher precompute, "
+                             "cross-modal matcher depth images, flow projection, and final visualizations. "
+                             "Defaults to the backend implied by --render_preset.")
+    parser.add_argument("--camera_aux_depth_mode", type=str, default="median",
+                        choices=["median", "expected", "depth"],
+                        help="Which depth map to consume from camera auxiliary renders. "
+                             "'median' uses the current 3DGUT median depth, 'expected' restores the older expected-depth behavior, "
+                             "and 'depth' uses the backend's default depth output directly.")
     parser.add_argument("--pure_pnp_photo_weight", type=float, default=0.0,
                         help="For pure PnP only: weight of sparse temporal photometric residuals built from depth-backed current-frame pixels projected into adjacent RGB frames.")
     parser.add_argument("--pure_pnp_photo_match_radius_px", type=float, default=4.0,
@@ -3909,9 +6136,61 @@ def main():
                         help="For pure PnP only: max distance from RGB-RGB temporal matches to accepted cross-modal source pixels for the depth residual.")
     parser.add_argument("--pure_pnp_depth_min_matches", type=int, default=8,
                         help="For pure PnP only: minimum supported pixels per temporal depth residual block.")
-    parser.add_argument("--pure_pnp_depth_render_backend", type=str, default="3dgut_rasterization",
-                        choices=["3dgut_rasterization", "surfel_rasterization", "raytracing"],
-                        help="For pure PnP only: backend used to render depth for cross-modal matching and temporal depth/photo residuals.")
+    parser.add_argument("--pure_pnp_depth_render_backend", type=str, default=None,
+                        choices=["3dgut_rasterization", "surfel_rasterization", "raytracing", "lidar_zbuffer", "lidar_scanline_zbuffer", "point_zbuffer"],
+                        help="For pure PnP only: backend used to render depth for cross-modal matching and temporal depth/photo residuals. "
+                             "Defaults to the backend implied by --render_preset.")
+    parser.add_argument("--pure_pnp_depth_mode", type=str, default=None,
+                        choices=["median", "expected", "depth"],
+                        help="For pure PnP only: which depth map to consume from rendered camera depth. "
+                             "Defaults to --camera_aux_depth_mode.")
+    parser.add_argument("--pure_pnp_residual_filter_mad_scale", type=float, default=0.0,
+                        help="For pure PnP only: if >0, trim high-residual correspondences after the first shared-consensus init using median+MAD thresholding.")
+    parser.add_argument("--pure_pnp_residual_filter_min_keep_ratio", type=float, default=0.5,
+                        help="For pure PnP only: minimum per-frame keep ratio enforced by consensus residual trimming.")
+    parser.add_argument("--pure_pnp_residual_filter_min_keep_per_frame", type=int, default=24,
+                        help="For pure PnP only: minimum number of correspondences retained per frame after residual trimming.")
+    parser.add_argument("--pure_pnp_residual_filter_max_reproj_error", type=float, default=0.0,
+                        help="For pure PnP only: optional absolute reprojection cap (px) applied after the MAD threshold; <=0 disables it.")
+    parser.add_argument("--pure_pnp_residual_filter_start_step", type=int, default=1,
+                        help="For pure PnP only: iterative PnP step index at which consensus residual trimming becomes active.")
+    parser.add_argument("--pure_pnp_single_frame_prefilter_min_inliers", type=int, default=0,
+                        help="For pure PnP only: if >0, drop whole frames whose single-frame PnP yields fewer inliers than this, then keep only each retained frame's single-frame RANSAC inliers.")
+    parser.add_argument("--pure_pnp_single_frame_prefilter_min_inlier_ratio", type=float, default=0.0,
+                        help="For pure PnP only: if >0, drop whole frames whose single-frame PnP inlier ratio is below this threshold before shared optimization.")
+    parser.add_argument("--pure_pnp_frame_disagreement_mad_scale", type=float, default=0.0,
+                        help="For pure PnP only: if >0, drop whole frames whose single-frame PnP disagrees with the shared init beyond a robust MAD threshold.")
+    parser.add_argument("--pure_pnp_frame_disagreement_min_keep_ratio", type=float, default=0.7,
+                        help="For pure PnP only: minimum frame keep ratio enforced by frame-disagreement filtering.")
+    parser.add_argument("--pure_pnp_frame_disagreement_min_keep_frames", type=int, default=12,
+                        help="For pure PnP only: minimum number of frames retained after frame-disagreement filtering.")
+    parser.add_argument("--pure_pnp_frame_disagreement_apply_max_dropped_frames", type=int, default=0,
+                        help="For pure PnP only: if >0 and frame-disagreement would drop more than this many frames, skip frame filtering and fall back to other enabled filters.")
+    parser.add_argument("--pure_pnp_filter_shared_ransac_outliers", action="store_true",
+                        help="For pure PnP only: drop the correspondences rejected by the initial global shared-RANSAC solve before the subsequent shared optimization.")
+    parser.add_argument("--pure_pnp_gt_reproj_filter_quantile", type=float, default=0.0,
+                        help="For pure PnP only: if >0 and GT is available, keep only the lowest GT-relative reprojection residual quantile of correspondences before shared optimization.")
+    parser.add_argument("--pure_pnp_gt_reproj_filter_min_keep_per_frame", type=int, default=24,
+                        help="For pure PnP only: minimum correspondences kept per frame when GT-relative reprojection filtering is enabled.")
+    parser.add_argument("--pure_pnp_gt_soft_weight_mode", type=str, default="none",
+                        choices=["none", "gt_reproj", "pose_balance"],
+                        help="For pure PnP only: if GT is available, learn a GT-supervised soft point-weight model and apply it before shared optimization. "
+                             "'gt_reproj' imitates low GT reprojection residual; 'pose_balance' also boosts translation-sensitive points to preserve translation constraints.")
+    parser.add_argument("--pure_pnp_gt_soft_weight_translation_alpha", type=float, default=0.5,
+                        help="For pure PnP only: exponent used by the GT pose-balance soft-weight target to boost translation-sensitive points. Higher values preserve more near/side translation signal.")
+    parser.add_argument("--pure_pnp_gt_pose_residual_weight", type=float, default=0.0,
+                        help="For pure PnP only: if >0 and GT extrinsic is available, add an explicit shared-pose residual term on the difference between the current relative extrinsic and the GT relative extrinsic.")
+    parser.add_argument("--pure_pnp_solver_backend", type=str, default="auto",
+                        choices=["auto", "opencv", "scipy"],
+                        help="For pure PnP only: shared extrinsic solver backend. 'auto' prefers OpenCV solvePnPRefineLM when the requested residuals/modes are compatible, otherwise falls back to SciPy.")
+    parser.add_argument("--pure_pnp_freeze_rotation", action="store_true",
+                        help="For pure PnP only: keep rotation fixed and optimize translation only during the shared-extrinsic solve.")
+    parser.add_argument("--pure_pnp_freeze_translation", action="store_true",
+                        help="For pure PnP only: keep translation fixed and optimize rotation only during the shared-extrinsic solve.")
+    parser.add_argument("--pure_pnp_export_match_diagnostics", action="store_true",
+                        help="For pure PnP only: export per-step match diagnostics JSON, including GT-vs-filter summaries when GT is available.")
+    parser.add_argument("--pure_pnp_export_gt_weight_analysis", action="store_true",
+                        help="For pure PnP only: export GT-supervised learned point-weight analysis per step to JSON+NPZ.")
     parser.add_argument("--pure_pnp_temporal_semidense_stride", type=int, default=0,
                         help="For pure PnP only: if >0, also sample semi-dense temporal source pixels from rendered depth on this stride.")
     parser.add_argument("--pure_pnp_temporal_semidense_max_points", type=int, default=0,
@@ -3930,19 +6209,49 @@ def main():
                         help="For pure PnP only: odd Gaussian blur kernel applied to RGB images after matcher initialization and before iterative cross-modal matching.")
     parser.add_argument("--pure_pnp_post_init_rgb_blur_sigma", type=float, default=0.0,
                         help="For pure PnP only: Gaussian blur sigma for post-init RGB matching images.")
+    parser.add_argument("--kitti_lidar_width", type=int, default=None,
+                        help="KITTI/KITTI-360 range-image width used when rasterizing raw LiDAR packets.")
+    parser.add_argument("--render_preset", type=str, default=None,
+                        help="High-level render stack preset for the current calib pipeline. "
+                             "Use 'hybrid_3dgrut' for LiDAR=3DGRT + Camera=3DGUT, or "
+                             "'lidar_rt'/'2dgs' for LiDAR=legacy lidar-rt + Camera=2DGS.")
     parser.add_argument("--output_dir",          default=None)
     parser.add_argument("--gpu",                 type=int, default=None)
     cli = parser.parse_args()
+    if cli.pure_pnp_freeze_rotation and cli.pure_pnp_freeze_translation:
+        parser.error("PurePnP cannot freeze both rotation and translation at the same time.")
 
     if cli.gpu is not None:
         torch.cuda.set_device(cli.gpu)
 
     args = parse(cli.exp_config)
     args = parse(cli.data_config, args)
+    render_preset = _normalize_render_preset(cli.render_preset)
     _dtype = str(getattr(args, "data_type", "")).lower()
+    _dtype_norm = _dtype.replace("-", "").replace("_", "")
+    default_camera_aux_depth_render_backend = "3dgut_rasterization"
+    default_pure_pnp_depth_render_backend = "3dgut_rasterization"
+    if "kitti" in _dtype_norm and "kitticalib" not in _dtype_norm:
+        default_camera_aux_depth_render_backend = "lidar_zbuffer"
+        default_pure_pnp_depth_render_backend = "lidar_zbuffer"
+    if render_preset is not None:
+        (
+            default_camera_aux_depth_render_backend,
+            default_pure_pnp_depth_render_backend,
+        ) = _apply_render_preset(args, render_preset)
+    resolved_camera_aux_depth_render_backend = (
+        cli.camera_aux_depth_render_backend or default_camera_aux_depth_render_backend
+    )
+    resolved_pure_pnp_depth_render_backend = (
+        cli.pure_pnp_depth_render_backend or default_pure_pnp_depth_render_backend
+    )
+    resolved_camera_aux_depth_mode = str(cli.camera_aux_depth_mode or "median")
+    resolved_pure_pnp_depth_mode = str(
+        cli.pure_pnp_depth_mode or resolved_camera_aux_depth_mode
+    )
 
     scene_id = getattr(args, "scene_id", "calib_scene")
-    out_dir  = cli.output_dir or os.path.join("output", "calib", scene_id)
+    out_dir  = cli.output_dir or os.path.join(DEFAULT_OUTPUT_ROOT, "calib", scene_id)
     os.makedirs(out_dir, exist_ok=True)
     command_path = os.path.join(out_dir, "command.sh")
     with open(command_path, "w", encoding="utf-8") as handle:
@@ -3955,10 +6264,25 @@ def main():
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(log_dir=os.path.join(out_dir, "tb"))
 
+    print(
+        blue(
+            "[Calib] Render stack: "
+            f"preset={render_preset or 'config'} | "
+            f"training_render_mode={getattr(getattr(args, 'model', None), 'training_render_mode', '')!r} | "
+            f"camera_render_backend={getattr(getattr(args, 'model', None), 'camera_render_backend', '')} | "
+            f"raytrace_backend={getattr(getattr(args, 'model', None), 'raytrace_backend', '')} | "
+            f"camera_aux_depth_render_backend={resolved_camera_aux_depth_render_backend} | "
+            f"camera_aux_depth_mode={resolved_camera_aux_depth_mode} | "
+            f"pure_pnp_depth_render_backend={resolved_pure_pnp_depth_render_backend} | "
+            f"pure_pnp_depth_mode={resolved_pure_pnp_depth_mode}"
+        )
+    )
+
     # ── Scene ─────────────────────────────────────────────────
     print(blue("[Calib] Loading scene..."))
     scene = dataloader.load_scene(args.source_dir, args)
     gaussians = scene.gaussians_assets[0]
+    setattr(args, "_calib_lidar_sensor", scene.train_lidar)
 
     # ── Camera data ───────────────────────────────────────────
     camera_scale = float(getattr(args, "camera_scale", 1))
@@ -4135,111 +6459,188 @@ def main():
         print(blue(f"[Calib] Init translation perturbation: {cli.init_trans_xyz}  "
                    f"(err={init_t_err:.4f} m)"))
 
+    if cli.lidar_depth_use_image_visibility_weights:
+        args.opt.lidar_depth_use_image_visibility_weights = True
+    if cli.lidar_depth_visible_weight is not None:
+        args.opt.lidar_depth_visible_weight = float(cli.lidar_depth_visible_weight)
+    if cli.lidar_depth_occluded_weight is not None:
+        args.opt.lidar_depth_occluded_weight = float(cli.lidar_depth_occluded_weight)
+    if cli.lidar_depth_outside_weight is not None:
+        args.opt.lidar_depth_outside_weight = float(cli.lidar_depth_outside_weight)
+    if cli.lidar_depth_visibility_tolerance is not None:
+        args.opt.lidar_depth_visibility_tolerance = float(cli.lidar_depth_visibility_tolerance)
+    if cli.lidar_depth_loss_mode is not None:
+        args.opt.lidar_depth_loss_mode = str(cli.lidar_depth_loss_mode)
+    if cli.lidar_depth_inverse_min_depth is not None:
+        args.opt.lidar_depth_inverse_min_depth = float(cli.lidar_depth_inverse_min_depth)
+
     # ── Run calibration ───────────────────────────────────────
-    final_R = run_noise_inject_calib(
-        gaussians=gaussians,
-        pose_correction=pose_correction,
-        cam_cameras=cam_cameras,
-        cam_images=cam_images,
-        scene=scene,
-        gt_l2c_R=gt_l2c_R,
-        gt_l2c_T=gt_l2c_T,
-        args=args,
-        total_cycles=cli.total_cycles,
-        iters_per_cycle=cli.iters_per_cycle,
-        rotation_lr=cli.rotation_lr,
-        translation_lr=cli.translation_lr,
-        freeze_gaussians=cli.freeze_gaussians,
-        freeze_xyz=cli.freeze_xyz,
-        freeze_colors=cli.freeze_colors,
-        freeze_covariance=cli.freeze_covariance,
-        freeze_opacity=cli.freeze_opacity,
-        translation_start_cycle=cli.translation_start_cycle,
-        stage2_freeze_colors=not cli.stage2_keep_colors_trainable,
-        warmup_cycles=cli.warmup_cycles,
-        freeze_rotation=cli.freeze_rotation,
-        freeze_translation=cli.freeze_translation,
-        lr_patience=cli.lr_patience,
-        lr_factor=cli.lr_factor,
-        lr_min=cli.lr_min,
-        pose_lr_drop_cycle=cli.pose_lr_drop_cycle,
-        pose_lr_drop_factor=cli.pose_lr_drop_factor,
-        lambda_rgb=cli.lambda_rgb if cli.lambda_rgb is not None else 1.0,
-        initial_gaussian_state=base_state,
-        tb_writer=tb_writer,
-        cycle_ckpt_dir=os.path.join(out_dir, "cycle_ckpts"),
-        save_cycle_every=cli.save_cycle_every,
-        resume_cycle_ckpt=cli.resume_cycle_ckpt,
-        resume_cycle_ckpt_scene_only=cli.resume_cycle_ckpt_scene_only,
-        reset_gaussians_every=cli.reset_gaussians_every,
-        disable_depth_after_cycle=cli.disable_depth_after_cycle,
-        rgb_only_updates_color=cli.rgb_only_updates_color,
-        lambda_depth=cli.lambda_depth if cli.lambda_depth is not None else 1.0,
-        matcher_pose_update=cli.matcher_pose_update,
-        matcher_color_supervision=cli.matcher_color_supervision,
-        matcher_color_weight=cli.matcher_color_weight,
-        camera_rgb_pose_only=cli.camera_rgb_pose_only,
-        color_warmup_cycles=cli.color_warmup_cycles,
-        initialize_pose_from_matcher=cli.initialize_pose_from_matcher,
-        post_init_supervision_blur_kernel=cli.post_init_supervision_blur_kernel,
-        post_init_supervision_blur_sigma=cli.post_init_supervision_blur_sigma,
-        post_init_supervision_blur_warmup_only=cli.post_init_supervision_blur_warmup_only,
-        freeze_gaussians_after_color_warmup=cli.freeze_gaussians_after_color_warmup,
-        pose_step_at_cycle_end=cli.pose_step_at_cycle_end,
-        pose_step_interval_iters=cli.pose_step_interval_iters,
-        matcher_adjacent_support=cli.matcher_adjacent_support,
-        matcher_adjacent_max_offset=cli.matcher_adjacent_max_offset,
-        matcher_support_radius_px=cli.matcher_support_radius_px,
-        matcher_adjacent_color_supervision=cli.matcher_adjacent_color_supervision,
-        matcher_adjacent_color_weight=cli.matcher_adjacent_color_weight,
-        disable_depth_during_color_warmup=cli.disable_depth_during_color_warmup,
-        post_warmup_rgb_reg_scale=cli.post_warmup_rgb_reg_scale,
-        matcher_color_lr_scale=cli.matcher_color_lr_scale,
-        matcher_update_interval=cli.matcher_update_interval if cli.matcher_update_interval is not None else int(getattr(pose_cfg, "matcher_update_interval", 1)),
-        matcher_update_blend=cli.matcher_update_blend if cli.matcher_update_blend is not None else float(getattr(pose_cfg, "matcher_update_blend", 1.0)),
-        matcher_name=cli.matcher_name or str(getattr(pose_cfg, "matcher_name", "matchanything-roma")),
-        matcher_max_num_keypoints=cli.matcher_max_num_keypoints if cli.matcher_max_num_keypoints is not None else int(getattr(pose_cfg, "matcher_max_num_keypoints", 2048)),
-        matcher_min_matches=cli.matcher_min_matches if cli.matcher_min_matches is not None else int(getattr(pose_cfg, "matcher_min_matches", 20)),
-        matcher_min_depth_matches=cli.matcher_min_depth_matches if cli.matcher_min_depth_matches is not None else int(getattr(pose_cfg, "matcher_min_depth_matches", 12)),
-        matcher_min_pnp_inliers=cli.matcher_min_pnp_inliers if cli.matcher_min_pnp_inliers is not None else int(getattr(pose_cfg, "matcher_min_pnp_inliers", 8)),
-        matcher_ransac_reproj_thresh=cli.matcher_ransac_reproj_thresh if cli.matcher_ransac_reproj_thresh is not None else float(getattr(pose_cfg, "matcher_ransac_reproj_thresh", 3.0)),
-        matcher_pnp_reproj_error=cli.matcher_pnp_reproj_error if cli.matcher_pnp_reproj_error is not None else float(getattr(pose_cfg, "matcher_pnp_reproj_error", 4.0)),
-        matcher_pnp_iterations=cli.matcher_pnp_iterations if cli.matcher_pnp_iterations is not None else int(getattr(pose_cfg, "matcher_pnp_iterations", 1000)),
-        matcher_depth_min=cli.matcher_depth_min if cli.matcher_depth_min is not None else float(getattr(pose_cfg, "matcher_depth_min", 0.1)),
-        matcher_depth_max=cli.matcher_depth_max if cli.matcher_depth_max is not None else float(getattr(pose_cfg, "matcher_depth_max", 80.0)),
-        matcher_depth_use_inverse=bool(cli.matcher_depth_use_inverse) if cli.matcher_depth_use_inverse is not None else bool(getattr(pose_cfg, "matcher_depth_use_inverse", True)),
-        matcher_depth_percentile_low=cli.matcher_depth_percentile_low if cli.matcher_depth_percentile_low is not None else float(getattr(pose_cfg, "matcher_depth_percentile_low", 5.0)),
-        matcher_depth_percentile_high=cli.matcher_depth_percentile_high if cli.matcher_depth_percentile_high is not None else float(getattr(pose_cfg, "matcher_depth_percentile_high", 95.0)),
-        matcher_dense_mode=cli.matcher_dense_mode,
-        matcher_dense_stride=cli.matcher_dense_stride,
-        matcher_dense_cert_threshold=cli.matcher_dense_cert_threshold,
-        matcher_dense_color_cert_threshold=cli.matcher_dense_color_cert_threshold,
-        match_once_per_cycle=not cli.no_match_once_per_cycle,
-        cross_frame_weight=cli.cross_frame_weight,
-        flow_proj_weight=cli.flow_proj_weight,
-        flow_proj_max_offset=cli.flow_proj_max_offset,
-        pure_pnp_iters=cli.pure_pnp_iters,
-        pure_pnp_photo_weight=cli.pure_pnp_photo_weight,
-        pure_pnp_photo_match_radius_px=cli.pure_pnp_photo_match_radius_px,
-        pure_pnp_photo_min_matches=cli.pure_pnp_photo_min_matches,
-        pure_pnp_photo_max_offset=cli.pure_pnp_photo_max_offset,
-        pure_pnp_flow_weight=cli.pure_pnp_flow_weight,
-        pure_pnp_flow_match_radius_px=cli.pure_pnp_flow_match_radius_px,
-        pure_pnp_flow_min_matches=cli.pure_pnp_flow_min_matches,
-        pure_pnp_depth_weight=cli.pure_pnp_depth_weight,
-        pure_pnp_depth_match_radius_px=cli.pure_pnp_depth_match_radius_px,
-        pure_pnp_depth_min_matches=cli.pure_pnp_depth_min_matches,
-        pure_pnp_depth_render_backend=cli.pure_pnp_depth_render_backend,
-        pure_pnp_temporal_semidense_stride=cli.pure_pnp_temporal_semidense_stride,
-        pure_pnp_temporal_semidense_max_points=cli.pure_pnp_temporal_semidense_max_points,
-        pure_pnp_temporal_gradient_scale=cli.pure_pnp_temporal_gradient_scale,
-        pure_pnp_init_depth_strat_bins=cli.pure_pnp_init_depth_strat_bins,
-        pure_pnp_init_depth_strat_max_points_per_bin=cli.pure_pnp_init_depth_strat_max_points_per_bin,
-        pure_pnp_far_depth_boost=cli.pure_pnp_far_depth_boost,
-        pure_pnp_far_depth_start_percentile=cli.pure_pnp_far_depth_start_percentile,
-        pure_pnp_post_init_rgb_blur_kernel=cli.pure_pnp_post_init_rgb_blur_kernel,
-        pure_pnp_post_init_rgb_blur_sigma=cli.pure_pnp_post_init_rgb_blur_sigma,
-    )
+    try:
+        final_R = run_noise_inject_calib(
+            gaussians=gaussians,
+            pose_correction=pose_correction,
+            cam_cameras=cam_cameras,
+            cam_images=cam_images,
+            scene=scene,
+            gt_l2c_R=gt_l2c_R,
+            gt_l2c_T=gt_l2c_T,
+            args=args,
+            total_cycles=cli.total_cycles,
+            iters_per_cycle=cli.iters_per_cycle,
+            rotation_lr=cli.rotation_lr,
+            translation_lr=cli.translation_lr,
+            freeze_gaussians=cli.freeze_gaussians,
+            freeze_xyz=cli.freeze_xyz,
+            freeze_colors=cli.freeze_colors,
+            freeze_covariance=cli.freeze_covariance,
+            freeze_opacity=cli.freeze_opacity,
+            translation_start_cycle=cli.translation_start_cycle,
+            stage2_freeze_colors=not cli.stage2_keep_colors_trainable,
+            warmup_cycles=cli.warmup_cycles,
+            freeze_rotation=cli.freeze_rotation,
+            freeze_translation=cli.freeze_translation,
+            lr_patience=cli.lr_patience,
+            lr_factor=cli.lr_factor,
+            lr_min=cli.lr_min,
+            pose_lr_drop_cycle=cli.pose_lr_drop_cycle,
+            pose_lr_drop_factor=cli.pose_lr_drop_factor,
+            translation_lr_drop_cycle=cli.translation_lr_drop_cycle,
+            translation_lr_drop_factor=cli.translation_lr_drop_factor,
+            lambda_rgb=cli.lambda_rgb if cli.lambda_rgb is not None else float(getattr(args.opt, "lambda_rgb", 1.0)),
+            lambda_dssim=cli.lambda_dssim if cli.lambda_dssim is not None else float(getattr(args.opt, "lambda_rgb_dssim", getattr(args.opt, "lambda_dssim", 0.2))),
+            lambda_reg=cli.lambda_reg if cli.lambda_reg is not None else float(getattr(args.opt, "lambda_reg", 0.0)),
+            geometry_conflict_policy=cli.geometry_conflict_policy,
+            geometry_conflict_camera_weight=cli.geometry_conflict_camera_weight,
+            lambda_normal=cli.lambda_normal if cli.lambda_normal is not None else float(getattr(args.opt, "lambda_normal", 0.0)),
+            warmup_camera_depth_normal_weight=cli.warmup_camera_depth_normal_weight,
+            warmup_disable_other_regularizers=cli.warmup_disable_other_regularizers,
+            initial_gaussian_state=base_state,
+            tb_writer=tb_writer,
+            cycle_ckpt_dir=os.path.join(out_dir, "cycle_ckpts"),
+            save_cycle_every=cli.save_cycle_every,
+            resume_cycle_ckpt=cli.resume_cycle_ckpt,
+            resume_cycle_ckpt_scene_only=cli.resume_cycle_ckpt_scene_only,
+            reset_gaussians_every=cli.reset_gaussians_every,
+            disable_depth_after_cycle=cli.disable_depth_after_cycle,
+            rgb_only_updates_color=cli.rgb_only_updates_color,
+            lambda_depth=cli.lambda_depth if cli.lambda_depth is not None else float(getattr(args.opt, "lambda_depth_l1", 1.0)),
+            matcher_pose_update=cli.matcher_pose_update,
+            matcher_color_supervision=cli.matcher_color_supervision,
+            matcher_color_weight=cli.matcher_color_weight,
+            camera_rgb_pose_only=cli.camera_rgb_pose_only,
+            color_warmup_cycles=cli.color_warmup_cycles,
+            initialize_pose_from_matcher=cli.initialize_pose_from_matcher,
+            post_init_supervision_blur_kernel=cli.post_init_supervision_blur_kernel,
+            post_init_supervision_blur_sigma=cli.post_init_supervision_blur_sigma,
+            post_init_supervision_blur_warmup_only=cli.post_init_supervision_blur_warmup_only,
+            freeze_gaussians_after_color_warmup=cli.freeze_gaussians_after_color_warmup,
+            freeze_gaussians_after_cycle=cli.freeze_gaussians_after_cycle,
+            pose_step_at_cycle_end=cli.pose_step_at_cycle_end,
+            pose_step_interval_iters=cli.pose_step_interval_iters,
+            matcher_adjacent_support=cli.matcher_adjacent_support,
+            matcher_adjacent_max_offset=cli.matcher_adjacent_max_offset,
+            matcher_support_radius_px=cli.matcher_support_radius_px,
+            matcher_adjacent_color_supervision=cli.matcher_adjacent_color_supervision,
+            matcher_adjacent_color_weight=cli.matcher_adjacent_color_weight,
+            disable_depth_during_color_warmup=cli.disable_depth_during_color_warmup,
+            post_warmup_rgb_reg_scale=cli.post_warmup_rgb_reg_scale,
+            matcher_color_lr_scale=cli.matcher_color_lr_scale,
+            matcher_update_interval=cli.matcher_update_interval if cli.matcher_update_interval is not None else int(getattr(pose_cfg, "matcher_update_interval", 1)),
+            matcher_update_blend=cli.matcher_update_blend if cli.matcher_update_blend is not None else float(getattr(pose_cfg, "matcher_update_blend", 1.0)),
+            matcher_name=cli.matcher_name or str(getattr(pose_cfg, "matcher_name", "matchanything-roma")),
+            matcher_minima_root=cli.matcher_minima_root or getattr(pose_cfg, "matcher_minima_root", None),
+            matcher_minima_ckpt=cli.matcher_minima_ckpt or getattr(pose_cfg, "matcher_minima_ckpt", None),
+            matcher_resize=cli.matcher_resize if cli.matcher_resize is not None else int(getattr(pose_cfg, "matcher_resize", 832)),
+            matcher_match_threshold=cli.matcher_match_threshold if cli.matcher_match_threshold is not None else float(getattr(pose_cfg, "matcher_match_threshold", 0.2)),
+            matcher_render_intrinsics_fx_scale=cli.matcher_render_intrinsics_fx_scale if cli.matcher_render_intrinsics_fx_scale is not None else float(getattr(pose_cfg, "matcher_render_intrinsics_fx_scale", 1.0)),
+            matcher_render_intrinsics_fy_scale=cli.matcher_render_intrinsics_fy_scale if cli.matcher_render_intrinsics_fy_scale is not None else float(getattr(pose_cfg, "matcher_render_intrinsics_fy_scale", 1.0)),
+            matcher_render_intrinsics_cx_offset=cli.matcher_render_intrinsics_cx_offset if cli.matcher_render_intrinsics_cx_offset is not None else float(getattr(pose_cfg, "matcher_render_intrinsics_cx_offset", 0.0)),
+            matcher_render_intrinsics_cy_offset=cli.matcher_render_intrinsics_cy_offset if cli.matcher_render_intrinsics_cy_offset is not None else float(getattr(pose_cfg, "matcher_render_intrinsics_cy_offset", 0.0)),
+            matcher_lidar_nn_max_distance=cli.matcher_lidar_nn_max_distance if cli.matcher_lidar_nn_max_distance is not None else float(getattr(pose_cfg, "matcher_lidar_nn_max_distance", 0.0)),
+            matcher_max_num_keypoints=cli.matcher_max_num_keypoints if cli.matcher_max_num_keypoints is not None else int(getattr(pose_cfg, "matcher_max_num_keypoints", 2048)),
+            matcher_min_matches=cli.matcher_min_matches if cli.matcher_min_matches is not None else int(getattr(pose_cfg, "matcher_min_matches", 20)),
+            matcher_min_depth_matches=cli.matcher_min_depth_matches if cli.matcher_min_depth_matches is not None else int(getattr(pose_cfg, "matcher_min_depth_matches", 12)),
+            matcher_min_pnp_inliers=cli.matcher_min_pnp_inliers if cli.matcher_min_pnp_inliers is not None else int(getattr(pose_cfg, "matcher_min_pnp_inliers", 8)),
+            matcher_ransac_reproj_thresh=cli.matcher_ransac_reproj_thresh if cli.matcher_ransac_reproj_thresh is not None else float(getattr(pose_cfg, "matcher_ransac_reproj_thresh", 3.0)),
+            matcher_pnp_reproj_error=cli.matcher_pnp_reproj_error if cli.matcher_pnp_reproj_error is not None else float(getattr(pose_cfg, "matcher_pnp_reproj_error", 4.0)),
+            matcher_pnp_iterations=cli.matcher_pnp_iterations if cli.matcher_pnp_iterations is not None else int(getattr(pose_cfg, "matcher_pnp_iterations", 1000)),
+            matcher_depth_min=cli.matcher_depth_min if cli.matcher_depth_min is not None else float(getattr(pose_cfg, "matcher_depth_min", 0.1)),
+            matcher_depth_max=cli.matcher_depth_max if cli.matcher_depth_max is not None else float(getattr(pose_cfg, "matcher_depth_max", 80.0)),
+            matcher_depth_use_inverse=bool(cli.matcher_depth_use_inverse) if cli.matcher_depth_use_inverse is not None else bool(getattr(pose_cfg, "matcher_depth_use_inverse", True)),
+            matcher_depth_percentile_low=cli.matcher_depth_percentile_low if cli.matcher_depth_percentile_low is not None else float(getattr(pose_cfg, "matcher_depth_percentile_low", 5.0)),
+            matcher_depth_percentile_high=cli.matcher_depth_percentile_high if cli.matcher_depth_percentile_high is not None else float(getattr(pose_cfg, "matcher_depth_percentile_high", 95.0)),
+            matcher_dense_mode=cli.matcher_dense_mode,
+            matcher_dense_stride=cli.matcher_dense_stride,
+            matcher_dense_cert_threshold=cli.matcher_dense_cert_threshold,
+            matcher_dense_color_cert_threshold=cli.matcher_dense_color_cert_threshold,
+            match_once_per_cycle=not cli.no_match_once_per_cycle,
+            cross_frame_weight=cli.cross_frame_weight,
+            flow_proj_weight=cli.flow_proj_weight,
+            flow_proj_max_offset=cli.flow_proj_max_offset,
+            camera_aux_depth_render_backend=resolved_camera_aux_depth_render_backend,
+            camera_aux_depth_mode=resolved_camera_aux_depth_mode,
+            pure_pnp_iters=cli.pure_pnp_iters,
+            pure_pnp_drop_first_n_frames=cli.pure_pnp_drop_first_n_frames,
+            pure_pnp_drop_last_n_frames=cli.pure_pnp_drop_last_n_frames,
+            pure_pnp_photo_weight=cli.pure_pnp_photo_weight,
+            pure_pnp_photo_match_radius_px=cli.pure_pnp_photo_match_radius_px,
+            pure_pnp_photo_min_matches=cli.pure_pnp_photo_min_matches,
+            pure_pnp_photo_max_offset=cli.pure_pnp_photo_max_offset,
+            pure_pnp_flow_weight=cli.pure_pnp_flow_weight,
+            pure_pnp_flow_match_radius_px=cli.pure_pnp_flow_match_radius_px,
+            pure_pnp_flow_min_matches=cli.pure_pnp_flow_min_matches,
+            pure_pnp_depth_weight=cli.pure_pnp_depth_weight,
+            pure_pnp_depth_match_radius_px=cli.pure_pnp_depth_match_radius_px,
+            pure_pnp_depth_min_matches=cli.pure_pnp_depth_min_matches,
+            pure_pnp_depth_render_backend=resolved_pure_pnp_depth_render_backend,
+            pure_pnp_depth_mode=resolved_pure_pnp_depth_mode,
+            pure_pnp_temporal_semidense_stride=cli.pure_pnp_temporal_semidense_stride,
+            pure_pnp_temporal_semidense_max_points=cli.pure_pnp_temporal_semidense_max_points,
+            pure_pnp_temporal_gradient_scale=cli.pure_pnp_temporal_gradient_scale,
+            pure_pnp_init_depth_strat_bins=cli.pure_pnp_init_depth_strat_bins,
+            pure_pnp_init_depth_strat_max_points_per_bin=cli.pure_pnp_init_depth_strat_max_points_per_bin,
+            pure_pnp_far_depth_boost=cli.pure_pnp_far_depth_boost,
+            pure_pnp_far_depth_start_percentile=cli.pure_pnp_far_depth_start_percentile,
+            pure_pnp_post_init_rgb_blur_kernel=cli.pure_pnp_post_init_rgb_blur_kernel,
+            pure_pnp_post_init_rgb_blur_sigma=cli.pure_pnp_post_init_rgb_blur_sigma,
+            periodic_pure_pnp_interval_cycles=cli.periodic_pure_pnp_interval_cycles,
+            disable_pose_grad_updates=cli.disable_pose_grad_updates,
+            pure_pnp_history_path=os.path.join(out_dir, "pure_pnp_history.jsonl"),
+            pure_pnp_match_diagnostics_dir=(
+                os.path.join(out_dir, "pure_pnp_match_diagnostics")
+                if cli.pure_pnp_export_match_diagnostics or cli.pure_pnp_residual_filter_mad_scale > 0.0
+                else None
+            ),
+            pure_pnp_residual_filter_mad_scale=cli.pure_pnp_residual_filter_mad_scale,
+            pure_pnp_residual_filter_min_keep_ratio=cli.pure_pnp_residual_filter_min_keep_ratio,
+            pure_pnp_residual_filter_min_keep_per_frame=cli.pure_pnp_residual_filter_min_keep_per_frame,
+            pure_pnp_residual_filter_max_reproj_error=cli.pure_pnp_residual_filter_max_reproj_error,
+            pure_pnp_residual_filter_start_step=cli.pure_pnp_residual_filter_start_step,
+            pure_pnp_single_frame_prefilter_min_inliers=cli.pure_pnp_single_frame_prefilter_min_inliers,
+            pure_pnp_single_frame_prefilter_min_inlier_ratio=cli.pure_pnp_single_frame_prefilter_min_inlier_ratio,
+            pure_pnp_frame_disagreement_mad_scale=cli.pure_pnp_frame_disagreement_mad_scale,
+            pure_pnp_frame_disagreement_min_keep_ratio=cli.pure_pnp_frame_disagreement_min_keep_ratio,
+            pure_pnp_frame_disagreement_min_keep_frames=cli.pure_pnp_frame_disagreement_min_keep_frames,
+            pure_pnp_frame_disagreement_apply_max_dropped_frames=cli.pure_pnp_frame_disagreement_apply_max_dropped_frames,
+            pure_pnp_filter_shared_ransac_outliers=cli.pure_pnp_filter_shared_ransac_outliers,
+            pure_pnp_gt_reproj_filter_quantile=cli.pure_pnp_gt_reproj_filter_quantile,
+            pure_pnp_gt_reproj_filter_min_keep_per_frame=cli.pure_pnp_gt_reproj_filter_min_keep_per_frame,
+            pure_pnp_gt_soft_weight_mode=cli.pure_pnp_gt_soft_weight_mode,
+            pure_pnp_gt_soft_weight_translation_alpha=cli.pure_pnp_gt_soft_weight_translation_alpha,
+            pure_pnp_gt_pose_residual_weight=cli.pure_pnp_gt_pose_residual_weight,
+            pure_pnp_optimize_rotation=not cli.pure_pnp_freeze_rotation,
+            pure_pnp_optimize_translation=not cli.pure_pnp_freeze_translation,
+            pure_pnp_solver_backend=cli.pure_pnp_solver_backend,
+            pure_pnp_gt_weight_analysis_dir=(
+                os.path.join(out_dir, "pure_pnp_gt_weight_analysis")
+                if cli.pure_pnp_export_gt_weight_analysis
+                else None
+            ),
+        )
+    finally:
+        if tb_writer is not None:
+            tb_writer.flush()
+            tb_writer.close()
 
     _save_run_visualizations(
         out_dir=out_dir,
@@ -4252,7 +6653,16 @@ def main():
         gt_l2c_T=gt_l2c_T,
         args=args,
         matcher_name=cli.matcher_name or str(getattr(pose_cfg, "matcher_name", "matchanything-roma")),
-        matcher_max_num_keypoints=cli.matcher_max_num_keypoints if cli.matcher_max_num_keypoints is not None else int(getattr(pose_cfg, "matcher_max_num_keypoints", 2048)),
+        matcher_minima_root=cli.matcher_minima_root or getattr(pose_cfg, "matcher_minima_root", None),
+        matcher_minima_ckpt=cli.matcher_minima_ckpt or getattr(pose_cfg, "matcher_minima_ckpt", None),
+        matcher_resize=cli.matcher_resize if cli.matcher_resize is not None else int(getattr(pose_cfg, "matcher_resize", 832)),
+        matcher_match_threshold=cli.matcher_match_threshold if cli.matcher_match_threshold is not None else float(getattr(pose_cfg, "matcher_match_threshold", 0.2)),
+            matcher_render_intrinsics_fx_scale=cli.matcher_render_intrinsics_fx_scale if cli.matcher_render_intrinsics_fx_scale is not None else float(getattr(pose_cfg, "matcher_render_intrinsics_fx_scale", 1.0)),
+            matcher_render_intrinsics_fy_scale=cli.matcher_render_intrinsics_fy_scale if cli.matcher_render_intrinsics_fy_scale is not None else float(getattr(pose_cfg, "matcher_render_intrinsics_fy_scale", 1.0)),
+            matcher_render_intrinsics_cx_offset=cli.matcher_render_intrinsics_cx_offset if cli.matcher_render_intrinsics_cx_offset is not None else float(getattr(pose_cfg, "matcher_render_intrinsics_cx_offset", 0.0)),
+            matcher_render_intrinsics_cy_offset=cli.matcher_render_intrinsics_cy_offset if cli.matcher_render_intrinsics_cy_offset is not None else float(getattr(pose_cfg, "matcher_render_intrinsics_cy_offset", 0.0)),
+            matcher_lidar_nn_max_distance=cli.matcher_lidar_nn_max_distance if cli.matcher_lidar_nn_max_distance is not None else float(getattr(pose_cfg, "matcher_lidar_nn_max_distance", 0.0)),
+            matcher_max_num_keypoints=cli.matcher_max_num_keypoints if cli.matcher_max_num_keypoints is not None else int(getattr(pose_cfg, "matcher_max_num_keypoints", 2048)),
         matcher_ransac_reproj_thresh=cli.matcher_ransac_reproj_thresh if cli.matcher_ransac_reproj_thresh is not None else float(getattr(pose_cfg, "matcher_ransac_reproj_thresh", 3.0)),
         matcher_min_matches=cli.matcher_min_matches if cli.matcher_min_matches is not None else int(getattr(pose_cfg, "matcher_min_matches", 20)),
         matcher_min_depth_matches=cli.matcher_min_depth_matches if cli.matcher_min_depth_matches is not None else int(getattr(pose_cfg, "matcher_min_depth_matches", 12)),
@@ -4264,8 +6674,33 @@ def main():
         matcher_adjacent_support=cli.matcher_adjacent_support,
         matcher_adjacent_max_offset=cli.matcher_adjacent_max_offset,
         matcher_support_radius_px=cli.matcher_support_radius_px,
+        camera_aux_depth_render_backend=resolved_camera_aux_depth_render_backend,
+        camera_aux_depth_mode=resolved_camera_aux_depth_mode,
     )
     print(green(f"[Calib] Visualizations saved to: {os.path.join(out_dir, 'visualizations')}"))
+    lidar_viz_dir = _save_lidar_supervision_depth_visualizations(
+        out_dir=out_dir,
+        gaussians=gaussians,
+        scene=scene,
+        args=args,
+    )
+    if lidar_viz_dir is not None:
+        print(green(f"[Calib] LiDAR depth visualizations saved to: {lidar_viz_dir}"))
+    gt_camera_viz_dir = _save_gt_camera_depth_visualizations(
+        out_dir=out_dir,
+        gaussians=gaussians,
+        pose_correction=pose_correction,
+        cam_cameras=cam_cameras,
+        cam_images=cam_images,
+        scene=scene,
+        gt_l2c_R=gt_l2c_R,
+        gt_l2c_T=gt_l2c_T,
+        args=args,
+        camera_aux_depth_render_backend=resolved_camera_aux_depth_render_backend,
+        camera_aux_depth_mode=resolved_camera_aux_depth_mode,
+    )
+    if gt_camera_viz_dir is not None:
+        print(green(f"[Calib] GT camera depth visualizations saved to: {gt_camera_viz_dir}"))
 
     # ── Save result ───────────────────────────────────────────
     if final_R is None:

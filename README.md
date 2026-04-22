@@ -1,6 +1,6 @@
 # hr-tiny
 
-Minimal LiDAR-camera extrinsic calibration using 3DGS + OptiX ray tracing.
+Minimal LiDAR-camera extrinsic calibration using 3DGS + 3DGRT/3DGUT rendering.
 Derived from HR-calib; stripped to calibration-only workflow.
 
 ## Setup
@@ -9,9 +9,27 @@ Derived from HR-calib; stripped to calibration-only workflow.
 conda create -n lidar-rt python=3.11.9 && conda activate lidar-rt
 pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
-pip install submodules/diff-lidar-tracer
 pip install submodules/simple-knn
 ```
+
+Warm up the 3DGRT/3DGUT runtime once after install. This downloads cached source snapshots into `~/.cache/hr-tiny/3dgrut/`, prepares sub-dependencies, and populates the persistent Torch extension cache so later runs do not rebuild every time.
+
+```bash
+python tools/warmup_3dgrut.py
+```
+
+By default:
+
+- camera rendering uses `3dgut`
+- LiDAR ray tracing uses `3dgrt`
+- compiled extensions are cached under `~/.cache/hr-tiny/3dgrut/<commit>/torch_extensions`
+
+Optional explicit training mode:
+
+- set `model.training_render_mode: hybrid_3dgrut`
+- this pins **LiDAR supervision** to `3dgrt` ray tracing
+- and pins **RGB supervision** to `3dgut` rasterization
+- use `configs/exp_kitti_10000_cam_single_opa_pose_higs_hybrid_3dgrut.yaml` as a ready-made KITTI exp config
 
 ## Data
 
@@ -189,7 +207,7 @@ Delete the `.npz` file to force recomputation.
 | `--total_cycles N` | Number of optimisation cycles |
 | `--iters_per_cycle N` | Gaussian update steps per cycle |
 | `--translation_start_cycle N` | Two-stage: rotation-only for N cycles, then add translation |
-| `--warmup_cycles N` | Freeze pose for first N cycles (Gaussian-only warmup) |
+| `--warmup_cycles N` | Pure LiDAR/depth warmup for first N cycles: freeze pose and disable camera-side supervision |
 | `--rotation_lr LR` | Learning rate for rotation quaternion |
 | `--checkpoint PATH` | Load a pre-trained Gaussian `.pth` instead of init from scratch |
 | `--resume_cycle_ckpt PATH` | Resume from a `cycle_NNNN.pth` checkpoint |

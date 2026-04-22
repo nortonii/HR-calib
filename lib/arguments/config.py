@@ -69,6 +69,8 @@ cfg.optim.lidar_depth_visible_weight = 2.0
 cfg.optim.lidar_depth_occluded_weight = 0.5
 cfg.optim.lidar_depth_outside_weight = 1.0
 cfg.optim.lidar_depth_visibility_tolerance = 0.25
+cfg.optim.lidar_depth_loss_mode = "l1"
+cfg.optim.lidar_depth_inverse_min_depth = 0.5
 
 # introduced by myself
 cfg.optim.max_screen_size = 20
@@ -88,11 +90,17 @@ cfg.model.sky.resolution = 1024
 cfg.model.sky.white_background = True
 
 cfg.model.use_color_correction = False
+cfg.model.dc_only_sh = True
 cfg.model.color_correction = CN()
 cfg.model.color_correction.mode = 'sensor' # [image, sensor]
 cfg.model.color_correction.use_mlp = False
+cfg.model.training_render_mode = ''
 cfg.model.camera_render_backend = "rasterization"
 cfg.model.freeze_gaussian_centers = False
+cfg.model.bkgd_init_scale = 0.0
+cfg.model.obj_init_scale = 0.0
+cfg.model.bkgd_init_min_distance = 0.0
+cfg.model.kitticalib_inverse_distance_init_num = -1
 
 cfg.model.use_pose_correction = False
 cfg.model.pose_correction = CN()
@@ -139,6 +147,7 @@ cfg.data.use_lidar = True
 cfg.data.use_semantic = False
 cfg.data.use_mono_depth = False
 cfg.data.use_mono_normal = False
+cfg.data.kitti_lidar_width = 2048
 
 
 cfg.render = CN()

@@ -29,8 +29,13 @@ class LiDARSensor:
         self.ego2world = {}
         self.range_image_return1 = {}  # key: frame, value: tensor(H, W, 4)
         self.range_image_return2 = {}  # key: frame, value: tensor(H, W, 4)
+        self.dynamic_mask_return1 = {}
+        self.dynamic_mask_return2 = {}
         self.pixel_pose = {}
         self.ray_origin = {}  # key: frame, value: tensor(3)/(H, 3)/(H, W, 3)
+        self.ray_direction = {}  # key: frame, value: tensor(3)/(H, 3)/(H, W, 3)
+        self.raw_points_local = {}
+        self.raw_intensity = {}
         self.H, self.W = 0, 0
         self.num_frames = 0
         self.train_frames = []
@@ -53,11 +58,25 @@ class LiDARSensor:
             raise ValueError("Could not recongnize the data type")
 
     def get_dynamic_mask(self, frame, return_num=1):
+        if return_num == 1 and frame in self.dynamic_mask_return1:
+            return self.dynamic_mask_return1[frame]
+        if return_num == 2 and frame in self.dynamic_mask_return2:
+            return self.dynamic_mask_return2[frame]
         ri = self.range_image_return1[frame] if return_num == 1 else self.range_image_return2[frame]
         if ri.shape[-1] > 2:
             return ri[..., 2] > 0
         # Dataset doesn't provide dynamic annotations — return all-False mask.
         return torch.zeros(ri.shape[:2], dtype=torch.bool, device=ri.device if hasattr(ri, 'device') else 'cpu')
+
+    def set_dynamic_mask(self, frame, return1=None, return2=None):
+        if return1 is not None:
+            if isinstance(return1, np.ndarray):
+                return1 = torch.from_numpy(return1)
+            self.dynamic_mask_return1[frame] = return1.bool().cpu()
+        if return2 is not None:
+            if isinstance(return2, np.ndarray):
+                return2 = torch.from_numpy(return2)
+            self.dynamic_mask_return2[frame] = return2.bool().cpu()
 
     def get_mask(self, frame, return_num=1):
         if return_num == 1:
@@ -70,6 +89,39 @@ class LiDARSensor:
             return self.range_image_return1[frame][..., 0]
         else:
             return self.range_image_return2[frame][..., 0]
+
+    def get_valid_depth_rays(self, frame, return_num=1):
+        depth = self.get_depth(frame, return_num=return_num)
+        valid_mask = self.get_mask(frame, return_num=return_num)
+        if not torch.any(valid_mask):
+            empty = torch.zeros((0, 3), device="cuda", dtype=torch.float32)
+            return empty, empty, torch.zeros((0,), device="cuda", dtype=torch.float32)
+
+        rays_o = self._expand_ray_tensor(
+            self.ray_origin.get(frame, self.sensor_center[frame]),
+            frame,
+            "ray_origin",
+        )
+        explicit_rays_d = self.ray_direction.get(frame, None)
+        if explicit_rays_d is not None:
+            rays_d = self._expand_ray_tensor(explicit_rays_d, frame, "ray_direction")
+            rays_d = rays_d / torch.clamp(torch.norm(rays_d, dim=-1, keepdim=True), min=1.0e-8)
+        else:
+            _, rays_d = self.get_range_rays(frame)
+
+        valid_rays_o = rays_o[valid_mask]
+        valid_rays_d = rays_d[valid_mask]
+        valid_depth = depth.to(device=valid_rays_o.device, dtype=torch.float32)[valid_mask]
+
+        # Reconstruct hit points and recompute directions from point-to-origin so
+        # LiDAR depth supervision can avoid depending on nominal beam tables.
+        hit_points = valid_rays_o + valid_rays_d * valid_depth.unsqueeze(-1)
+        valid_rays_d = hit_points - valid_rays_o
+        valid_rays_d = valid_rays_d / torch.clamp(
+            torch.norm(valid_rays_d, dim=-1, keepdim=True),
+            min=1.0e-8,
+        )
+        return valid_rays_o, valid_rays_d, valid_depth
 
     def get_intensity(self, frame, return_num=1):
         if return_num == 1:
@@ -98,7 +150,20 @@ class LiDARSensor:
             len(self.train_frames) + len(self.eval_frames) <= self.num_frames
         ), "Found illegal frame ranges!"
 
-    def add_frame(self, frame, ego2world, r1, r2, pixel_pose=None, ray_origin=None):
+    def get_raw_points(self, frame, world: bool = False):
+        if frame not in self.raw_points_local:
+            return self.inverse_projection(frame)
+        points_local = self.raw_points_local[frame].float()
+        intensity = self.raw_intensity[frame].float()
+        if not world:
+            return points_local.clone(), intensity.clone()
+        sensor2world = self.sensor2world[frame].float()
+        rotation = sensor2world[:3, :3]
+        translation = sensor2world[:3, 3]
+        points_world = points_local @ rotation.T + translation
+        return points_world, intensity.clone()
+
+    def add_frame(self, frame, ego2world, r1, r2, pixel_pose=None, ray_origin=None, ray_direction=None, raw_points=None, raw_intensity=None):
         if isinstance(ego2world, np.ndarray):
             ego2world = torch.from_numpy(ego2world)
         if isinstance(r1, np.ndarray):
@@ -127,6 +192,20 @@ class LiDARSensor:
             if isinstance(ray_origin, np.ndarray):
                 ray_origin = torch.from_numpy(ray_origin)
             self.ray_origin[frame] = ray_origin.float().cpu()
+
+        if ray_direction is not None:
+            if isinstance(ray_direction, np.ndarray):
+                ray_direction = torch.from_numpy(ray_direction)
+            self.ray_direction[frame] = ray_direction.float().cpu()
+
+        if raw_points is not None:
+            if isinstance(raw_points, np.ndarray):
+                raw_points = torch.from_numpy(raw_points)
+            self.raw_points_local[frame] = raw_points.float().cpu()
+        if raw_intensity is not None:
+            if isinstance(raw_intensity, np.ndarray):
+                raw_intensity = torch.from_numpy(raw_intensity)
+            self.raw_intensity[frame] = raw_intensity.float().cpu().reshape(-1)
 
         if self.H == 0 and self.W == 0:
             self.H, self.W, _ = self.range_image_return1[frame].shape
@@ -161,7 +240,7 @@ class LiDARSensor:
             pixel_pose_r1 = self.pixel_pose[frame]
             pts_r1 = apply_pixel_pose(pts_r1, pixel_pose_r1)
 
-        mask = lidar_intensity_r1 != -1
+        mask = lidar_pts_r1 > 0
         pts_r1, lidar_intensity_r1 = pts_r1[mask], lidar_intensity_r1[mask]
 
         lidar_pts_r2 = self.range_image_return2[frame][..., 0]
@@ -172,7 +251,7 @@ class LiDARSensor:
             pixel_pose_r2 = self.pixel_pose[frame]
             pts_r2 = apply_pixel_pose(pts_r2, pixel_pose_r2)
 
-        mask = lidar_intensity_r2 != -1
+        mask = lidar_pts_r2 > 0
         pts_r2, lidar_intensity_r2 = pts_r2[mask], lidar_intensity_r2[mask]
 
         pts = torch.cat([pts_r1, pts_r2], dim=0).cpu()
@@ -359,41 +438,54 @@ class LiDARSensor:
         points = rays_o + rays_d * range_map[..., None].cuda()
         return points
 
+    def _expand_ray_tensor(self, ray_tensor, frame, name):
+        if not torch.is_tensor(ray_tensor):
+            rays = torch.tensor(ray_tensor, dtype=torch.float32, device="cuda")
+        else:
+            rays = ray_tensor.to(device="cuda", dtype=torch.float32)
+
+        if rays.dim() == 1:
+            if rays.numel() != 3:
+                raise ValueError(
+                    f"{name} for frame {frame} must have 3 values, got {tuple(rays.shape)}"
+                )
+            rays = rays[None, None, :].expand(self.H, self.W, 3)
+        elif rays.dim() == 2:
+            if rays.shape == (self.H, 3):
+                rays = rays[:, None, :].expand(self.H, self.W, 3)
+            elif rays.shape == (self.W, 3):
+                rays = rays[None, :, :].expand(self.H, self.W, 3)
+            else:
+                raise ValueError(
+                    f"{name} for frame {frame} must be (3,), ({self.H}, 3), ({self.W}, 3) or ({self.H}, {self.W}, 3), got {tuple(rays.shape)}"
+                )
+        elif rays.dim() == 3:
+            if rays.shape != (self.H, self.W, 3):
+                raise ValueError(
+                    f"{name} for frame {frame} must be (H, W, 3), got {tuple(rays.shape)}"
+                )
+        else:
+            raise ValueError(
+                f"{name} for frame {frame} must be 1D/2D/3D tensor, got {tuple(rays.shape)}"
+            )
+
+        return rays
+
     def get_range_rays(self, frame):
         ir = self.inclination_bounds
         sensor2world = self.sensor2world[frame]
         sensor_center = self.sensor_center[frame]
 
-        rays_o = self.ray_origin.get(frame, sensor_center)
-        if not torch.is_tensor(rays_o):
-            rays_o = torch.tensor(rays_o, dtype=torch.float32, device="cuda")
-        else:
-            rays_o = rays_o.to(device="cuda", dtype=torch.float32)
-
-        if rays_o.dim() == 1:
-            if rays_o.numel() != 3:
-                raise ValueError(
-                    f"ray_origin for frame {frame} must have 3 values, got {tuple(rays_o.shape)}"
-                )
-            rays_o = rays_o[None, None, :].expand(self.H, self.W, 3)
-        elif rays_o.dim() == 2:
-            if rays_o.shape == (self.H, 3):
-                rays_o = rays_o[:, None, :].expand(self.H, self.W, 3)
-            elif rays_o.shape == (self.W, 3):
-                rays_o = rays_o[None, :, :].expand(self.H, self.W, 3)
-            else:
-                raise ValueError(
-                    f"ray_origin for frame {frame} must be (3,), ({self.H}, 3), ({self.W}, 3) or ({self.H}, {self.W}, 3), got {tuple(rays_o.shape)}"
-                )
-        elif rays_o.dim() == 3:
-            if rays_o.shape != (self.H, self.W, 3):
-                raise ValueError(
-                    f"ray_origin for frame {frame} must be (H, W, 3), got {tuple(rays_o.shape)}"
-                )
-        else:
-            raise ValueError(
-                f"ray_origin for frame {frame} must be 1D/2D/3D tensor, got {tuple(rays_o.shape)}"
-            )
+        rays_o = self._expand_ray_tensor(
+            self.ray_origin.get(frame, sensor_center),
+            frame,
+            "ray_origin",
+        )
+        explicit_rays_d = self.ray_direction.get(frame, None)
+        if explicit_rays_d is not None:
+            rays_d = self._expand_ray_tensor(explicit_rays_d, frame, "ray_direction")
+            rays_d = rays_d / torch.clamp(torch.norm(rays_d, dim=-1, keepdim=True), min=1.0e-8)
+            return rays_o, rays_d
 
         y = torch.ones(self.H, device="cuda", dtype=torch.float32)
         x = (

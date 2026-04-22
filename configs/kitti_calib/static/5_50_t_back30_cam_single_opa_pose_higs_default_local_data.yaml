@@ -1,0 +1,6 @@
+parent_config: "configs/kitti_calib/static/5_50_t_cam_single_opa_pose_higs_default_local_data.yaml"
+
+frame_length: [20, 49]
+eval_frames: [25, 35, 45]
+
+scene_id: kc_5_50_t_back30_cam_single_opa_pose_higs_default_gtt_fastlr

@@ -7,3 +7,6 @@ eval_frames: [5, 15, 25, 35, 45]
 scene_id: kc_5_50_t_cam_single_opa_pose_higs
 
 dynamic: False
+
+model:
+  inverse_distance_init_num: 0

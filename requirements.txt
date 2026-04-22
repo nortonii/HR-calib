@@ -21,6 +21,7 @@ torchmetrics
 tensorboard
 tensorboardX
 lpips
+slangtorch
 
 # image
 imgviz
@@ -54,5 +55,4 @@ tensorflow
 protobuf==3.20.3
 
 # extensions
-submodules/diff-lidar-tracer
 submodules/simple-knn

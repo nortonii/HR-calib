@@ -229,8 +229,13 @@ def _patch_threedgut_setup(source_dir: Path) -> None:
     _patch_flag_block("cuda_cflags")
     patched = "\n".join(lines) + "\n"
     tmp_path = setup_path.with_suffix(setup_path.suffix + ".tmp")
+    tmp_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path.write_text(patched, encoding="utf-8")
-    tmp_path.replace(setup_path)
+    try:
+        tmp_path.replace(setup_path)
+    except FileNotFoundError:
+        if not setup_path.exists():
+            raise
 
 
 def activate_threedgrut_runtime() -> Path:
@@ -497,6 +502,17 @@ def _reshape_depth_for_view(depth: torch.Tensor, height: int, width: int) -> tor
     raise ValueError(f"Unsupported depth layout {shape} for expected view {(height, width)}")
 
 
+def _resolve_3dgut_depth_maps(
+    integrated_depth: torch.Tensor,
+    opacity: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    alpha = opacity.clamp(0.0, 1.0)
+    expected_depth = torch.zeros_like(integrated_depth)
+    valid_alpha = alpha > 1.0e-8
+    expected_depth[valid_alpha] = integrated_depth[valid_alpha] / alpha[valid_alpha]
+    return expected_depth, integrated_depth, alpha
+
+
 def render_lidar_with_3dgrt(
     frame: int,
     gaussian_assets: list[GaussianModel],
@@ -521,6 +537,9 @@ def render_lidar_with_3dgrt(
 
     if isinstance(sensor, Camera):
         rays_o, rays_d = camera_to_rays(sensor)
+        height, width = int(sensor.image_height), int(sensor.image_width)
+        rays_o = rays_o.view(height, width, 3).contiguous()
+        rays_d = rays_d.view(height, width, 3).contiguous()
     elif isinstance(sensor, LiDARSensor):
         rays_o, rays_d = sensor.get_range_rays(frame)
     elif isinstance(sensor, tuple):
@@ -552,8 +571,12 @@ def render_lidar_with_3dgrt(
 
     height, width = rays_o.shape[0], rays_o.shape[1]
     rendered_attrs = _reshape_image_for_view(traced["pred_rgb"].squeeze(0), height, width)
-    depth = _reshape_depth_for_view(traced["pred_dist"].squeeze(0), height, width)
+    depth_integrated = _reshape_depth_for_view(traced["pred_dist"].squeeze(0), height, width)
     opacity = _reshape_depth_for_view(traced["pred_opacity"].squeeze(0), height, width)
+    depth, depth_integrated, opacity = _resolve_3dgut_depth_maps(
+        depth_integrated,
+        opacity,
+    )
     normals = _reshape_image_for_view(traced["pred_normals"].squeeze(0), height, width)
     visibility = traced.get("mog_visibility")
     if visibility is None:
@@ -577,6 +600,8 @@ def render_lidar_with_3dgrt(
         "rendered_attrs": rendered_attrs,
         "rgb": rendered_attrs,
         "depth": depth,
+        "depth_expected": depth,
+        "depth_integrated": depth_integrated,
         "intensity": intensity,
         "raydrop": raydrop_prob,
         "accumulation": opacity,
@@ -619,7 +644,12 @@ def render_camera_with_3dgut(
     )
     traced = tracer.render(gaussians, batch, train=torch.is_grad_enabled(), frame_id=int(camera.timestamp))
     pred_rgb = _reshape_image_for_view(traced["pred_rgb"].squeeze(0), height, width)
-    pred_depth = _reshape_depth_for_view(traced["pred_dist"].squeeze(0), height, width)
+    pred_depth_integrated = _reshape_depth_for_view(traced["pred_dist"].squeeze(0), height, width)
+    pred_opacity = _reshape_depth_for_view(traced["pred_opacity"].squeeze(0), height, width)
+    pred_depth, pred_depth_integrated, pred_alpha = _resolve_3dgut_depth_maps(
+        pred_depth_integrated,
+        pred_opacity,
+    )
     visibility = traced.get("mog_visibility")
     if visibility is None:
         visibility = torch.zeros((gaussians.num_gaussians,), device=pred_rgb.device, dtype=pred_rgb.dtype)
@@ -636,6 +666,9 @@ def render_camera_with_3dgut(
     return {
         "rgb": pred_rgb,
         "depth": pred_depth,
+        "depth_expected": pred_depth,
+        "depth_integrated": pred_depth_integrated,
+        "alpha": pred_alpha,
         "invdepth": invdepth,
         "screenspace_points": screenspace_points,
         "radii": visibility,

@@ -261,7 +261,9 @@ def safe_state(silent):
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
-    torch.cuda.set_device(torch.device("cuda:0"))
+    if torch.cuda.is_available():
+        current_device = torch.cuda.current_device()
+        torch.cuda.set_device(torch.device(f"cuda:{current_device}"))
 
 def fill_zeros_with_previous_nonzero(arr, co_dict):
     first_nonzero = None

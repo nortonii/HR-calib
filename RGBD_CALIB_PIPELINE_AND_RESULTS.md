@@ -116,7 +116,6 @@
 - `--matcher_update_interval`
 - `--matcher_update_blend`
 - `--matcher_name`
-- `--lidar_updates_opacity_covariance_only`
 
 并把 matcher 更新接到了 `pose_correction.apply_relative_camera_transform(...)`。
 
@@ -139,7 +138,6 @@
   --total_cycles 5 --iters_per_cycle 150 \
   --matcher_pose_update --matcher_update_interval 1 \
   --matcher_name matchanything-roma \
-  --lidar_updates_opacity_covariance_only \
   --save_cycle_every 1 \
   --output_dir output/calib/cycle_matcher_poseonly_lidaropacov_5_50_t
 ```
@@ -163,7 +161,7 @@
 
 结论：
 
-- 这条“**matcher 更新 pose + LiDAR 只调 opacity/covariance**”的实验链已经能稳定工作；
+- 这条“**matcher 更新 pose + LiDAR 端只做受限几何更新**”的实验链已经能稳定工作；
 - 第一个 cycle 就能把大误差快速拉回；
 - 后续 cycle 是小步 refinement，波动不大；
 - 至少在 `5-50-t` 上，这个思路是可行的。

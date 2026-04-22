@@ -6,8 +6,6 @@ model:
   use_pose_correction: False
   inverse_distance_init_num: 10000
 
-camera_dual_opacity: False
-
 opt:
   lambda_rgb: 1.0
   densify_grad_source: camera

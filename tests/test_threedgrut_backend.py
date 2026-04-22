@@ -4,13 +4,15 @@ import unittest
 
 import torch
 
-from lib.gaussian_renderer import get_lidar_raytrace_backend
+from lib.gaussian_renderer import _resolve_expected_depth, get_lidar_raytrace_backend
+from tools.calib import _resolve_visualization_depth_backend
 from lib.gaussian_renderer.camera_render import get_camera_render_backend
 from lib.gaussian_renderer.threedgrut_backend import (
     _camera_intrinsics,
     _expand_scales_for_threedgrut,
     _flatten_sh_features,
     _install_ncore_shim_if_missing,
+    _resolve_3dgut_depth_maps,
 )
 from lib.scene.cameras import Camera
 from lib.utils.graphics_utils import focal2fov, getProjectionMatrix
@@ -46,10 +48,19 @@ class ThreeDGrutBackendTests(unittest.TestCase):
         self.assertEqual(get_camera_render_backend(_Args(camera_backend="3dgut")), "3dgut_rasterization")
         self.assertEqual(get_camera_render_backend(_Args(camera_backend="gut")), "3dgut_rasterization")
         self.assertEqual(get_camera_render_backend(_Args(camera_backend="raytrace")), "raytracing")
+        self.assertEqual(get_camera_render_backend(_Args(camera_backend="2dgs")), "surfel_rasterization")
 
     def test_lidar_backend_aliases(self):
         self.assertEqual(get_lidar_raytrace_backend(_Args(raytrace_backend="3dgrut")), "3dgrt")
         self.assertEqual(get_lidar_raytrace_backend(_Args(raytrace_backend="diff_lidar_tracer")), "legacy")
+
+    def test_visualization_depth_uses_dense_raytracing_for_lidar_zbuffer(self):
+        self.assertEqual(_resolve_visualization_depth_backend("lidar_zbuffer"), "raytracing")
+        self.assertEqual(_resolve_visualization_depth_backend("lidar_scanline_zbuffer"), "raytracing")
+        self.assertEqual(
+            _resolve_visualization_depth_backend("3dgut_rasterization"),
+            "3dgut_rasterization",
+        )
 
     def test_hybrid_training_mode_overrides_backends(self):
         args = _Args(camera_backend="rasterization", raytrace_backend="legacy", training_render_mode="hybrid_3dgrut")
@@ -111,6 +122,20 @@ class ThreeDGrutBackendTests(unittest.TestCase):
         )
         self.assertAlmostEqual(float(projection[0, 2]), (width - 2.0 * cx) / width, places=6)
         self.assertAlmostEqual(float(projection[1, 2]), (2.0 * cy - height) / height, places=6)
+
+    def test_resolve_3dgut_depth_maps_normalizes_by_opacity(self):
+        integrated = torch.tensor([[4.0, 9.0], [0.0, 2.0]])
+        opacity = torch.tensor([[0.5, 1.0], [0.0, 0.25]])
+        expected, preserved_integrated, alpha = _resolve_3dgut_depth_maps(integrated, opacity)
+        self.assertTrue(torch.equal(expected, torch.tensor([[8.0, 9.0], [0.0, 8.0]])))
+        self.assertTrue(torch.equal(preserved_integrated, integrated))
+        self.assertTrue(torch.equal(alpha, opacity))
+
+    def test_resolve_expected_depth_normalizes_lidar_depth(self):
+        integrated = torch.tensor([[[4.0], [9.0]], [[0.0], [2.0]]])
+        accumulation = torch.tensor([[[0.5], [1.0]], [[0.0], [0.25]]])
+        expected = _resolve_expected_depth(integrated, accumulation)
+        self.assertTrue(torch.equal(expected, torch.tensor([[[8.0], [9.0]], [[0.0], [8.0]]])))
 
 
 if __name__ == "__main__":
