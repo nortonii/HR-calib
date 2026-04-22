@@ -394,9 +394,7 @@ class CameraPoseCorrection(nn.Module):
         if bool(self.use_gt_translation):
             extrinsic_translation = self.gt_lidar_to_camera_translation[0].to(device=device)
         else:
-            extrinsic_translation = (
-                delta_rotation @ base_extrinsic_translation.unsqueeze(-1)
-                ).squeeze(-1) + delta_translation
+            extrinsic_translation = base_extrinsic_translation + delta_translation
         return extrinsic_rotation, extrinsic_translation
 
     @torch.no_grad()
@@ -419,12 +417,12 @@ class CameraPoseCorrection(nn.Module):
             delta_q = -delta_q
         self.delta_rotations_quat[pose_index].copy_(delta_q)
 
-        # Translation delta
-        effective_R = extrinsic_rotation
+        # Shared-extrinsic translation is modeled independently of rotation:
+        # corrected_lidar_to_camera() reconstructs it as base_translation + delta_translation.
+        # So when setting an absolute l2c translation here, we must store the direct offset
+        # from the base translation rather than mixing in the extrinsic rotation.
         base_translation = self.base_lidar_to_camera_translation[0]
-        delta_translation = extrinsic_translation - (
-            effective_R @ base_translation.unsqueeze(-1)
-        ).squeeze(-1)
+        delta_translation = extrinsic_translation - base_translation
         self.delta_translations[pose_index].copy_(delta_translation)
 
     @torch.no_grad()
@@ -468,9 +466,12 @@ class CameraPoseCorrection(nn.Module):
         relative_translation = relative_translation.to(device=device, dtype=dtype)
         current_rotation, current_translation = self.corrected_lidar_to_camera(frame_id, device=device)
         target_rotation = relative_rotation @ current_rotation
-        target_translation = (
-            relative_rotation @ current_translation.unsqueeze(-1)
-        ).squeeze(-1) + relative_translation
+        if bool(self.use_gt_translation):
+            target_translation = current_translation
+        else:
+            target_translation = (
+                relative_rotation @ current_translation.unsqueeze(-1)
+            ).squeeze(-1) + relative_translation
         self.set_lidar_to_camera(frame_id, target_rotation, target_translation)
 
     def corrected_camera(self, camera: Camera, device="cuda"):
@@ -560,9 +561,7 @@ class CameraPoseCorrection(nn.Module):
             else:
                 gt_translation = self.gt_lidar_to_camera_translation[0].to(device=device)
                 base_translation = self.base_lidar_to_camera_translation[0].to(device=device)
-                gt_delta_translation = gt_translation - (
-                    gt_delta_rotation @ base_translation.unsqueeze(-1)
-                ).squeeze(-1)
+                gt_delta_translation = gt_translation - base_translation
         elif self.pose_mode == "all":
             init_rotation = self.pose_init_rotations[pose_index].to(device=device)
             init_translation = self.pose_init_translations[pose_index].to(device=device)
@@ -663,7 +662,7 @@ class CameraPoseCorrection(nn.Module):
             gt_rotation = self.gt_lidar_to_camera_rotation[0].to(device=device)
             gt_translation = self.gt_lidar_to_camera_translation[0].to(device=device)
 
-            pred_translation = (pred_rotation @ base_translation.unsqueeze(-1)).squeeze(-1) + delta_translation
+            pred_translation = base_translation + delta_translation
             relative_rotation = pred_rotation.transpose(0, 1) @ gt_rotation
             translation_error = gt_translation - pred_translation
             return {
