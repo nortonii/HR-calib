@@ -1,0 +1,6 @@
+parent_config: "configs/waymo/static/segment_1005.yaml"
+
+frame_length: [0, 1]
+eval_frames: [0]
+
+scene_id: waymo_segment_1005_smoke

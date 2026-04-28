@@ -54,6 +54,7 @@ _WAYMO_DYNAMIC_LABEL_TYPES = {
     label_pb2.Label.TYPE_PEDESTRIAN,
     label_pb2.Label.TYPE_CYCLIST,
 }
+_WAYMO_DYNAMIC_MASK_SCALE = 1.2
 _WAYMO_CAMERA_SUFFIXES = (
     "_FRONT",
     "_FRONT_LEFT",
@@ -73,6 +74,20 @@ def _normalize_waymo_label_id(label_id: str) -> str:
         if label_id.endswith(suffix):
             return label_id[: -len(suffix)]
     return label_id
+
+
+def _waymo_dynamic_id_variants(dynamic_ids: set[str]) -> set[str]:
+    variants = set()
+    for label_id in dynamic_ids:
+        norm = _normalize_waymo_label_id(str(label_id))
+        if not norm:
+            continue
+        variants.add(norm)
+        try:
+            variants.add(str(int(norm)))
+        except ValueError:
+            pass
+    return variants
 
 
 def _collect_waymo_dynamic_label_ids(frame_data, speed_threshold_mps: float = 0.5):
@@ -102,6 +117,55 @@ def _collect_waymo_dynamic_label_ids(frame_data, speed_threshold_mps: float = 0.
     return dynamic_ids, dynamic_boxes
 
 
+def _decode_waymo_camera_panoptic(segmentation_label) -> np.ndarray | None:
+    payload = bytes(segmentation_label.panoptic_label)
+    if not payload:
+        return None
+    arr = np.frombuffer(payload, dtype=np.uint8)
+    decoded = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if decoded is None:
+        return None
+    if decoded.ndim == 3:
+        decoded = decoded[..., 0]
+    return np.asarray(decoded)
+
+
+def _build_waymo_camera_supervision_mask_from_segmentation(
+    camera_segmentation_label,
+    width: int,
+    height: int,
+    dynamic_ids: set[str],
+) -> np.ndarray | None:
+    panoptic = _decode_waymo_camera_panoptic(camera_segmentation_label)
+    if panoptic is None:
+        return None
+    if panoptic.shape[0] != int(height) or panoptic.shape[1] != int(width):
+        panoptic = cv2.resize(
+            panoptic,
+            (int(width), int(height)),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    divisor = int(camera_segmentation_label.panoptic_label_divisor)
+    if divisor <= 0:
+        return None
+
+    dynamic_variants = _waymo_dynamic_id_variants(dynamic_ids)
+    local_to_global = {}
+    for mapping in camera_segmentation_label.instance_id_to_global_id_mapping:
+        local_to_global[int(mapping.local_instance_id)] = str(int(mapping.global_instance_id))
+    if not local_to_global:
+        return None
+
+    instance_ids = (panoptic.astype(np.int64) % np.int64(divisor)).astype(np.int32)
+    mask = np.zeros(instance_ids.shape, dtype=bool)
+    for local_id, global_id in local_to_global.items():
+        if local_id <= 0:
+            continue
+        if global_id in dynamic_variants:
+            mask |= instance_ids == int(local_id)
+    return mask
+
+
 def _add_waymo_box_to_mask(mask: np.ndarray, box, scale: int = 1, pad_px: int = 4):
     if mask.size == 0:
         return
@@ -109,8 +173,8 @@ def _add_waymo_box_to_mask(mask: np.ndarray, box, scale: int = 1, pad_px: int = 
     height = mask.shape[0]
     cx = float(box.center_x) / float(scale)
     cy = float(box.center_y) / float(scale)
-    bw = float(box.length) / float(scale)
-    bh = float(box.width) / float(scale)
+    bw = (float(box.length) * float(_WAYMO_DYNAMIC_MASK_SCALE)) / float(scale)
+    bh = (float(box.width) * float(_WAYMO_DYNAMIC_MASK_SCALE)) / float(scale)
     half_w = 0.5 * bw
     half_h = 0.5 * bh
     x0 = max(int(math.floor(cx - half_w)) - int(pad_px), 0)
@@ -129,6 +193,19 @@ def _build_waymo_camera_supervision_mask(
     scale: int,
     dynamic_ids: set[str],
 ):
+    for image in frame_data.images:
+        if int(image.name) != int(camera_id):
+            continue
+        if image.HasField("camera_segmentation_label"):
+            seg_mask = _build_waymo_camera_supervision_mask_from_segmentation(
+                image.camera_segmentation_label,
+                width=int(width),
+                height=int(height),
+                dynamic_ids=dynamic_ids,
+            )
+            if seg_mask is not None:
+                return torch.from_numpy(seg_mask)
+
     mask = np.zeros((height, width), dtype=bool)
     for label_set in frame_data.projected_lidar_labels:
         if int(label_set.name) != int(camera_id):
@@ -171,7 +248,10 @@ def _build_waymo_range_dynamic_mask(
     mask.zero_()
     for box in dynamic_boxes:
         center = torch.from_numpy(box["center"]).float()
-        size = torch.from_numpy(box["size"]).float() + float(box_pad_m) * 2.0
+        size = (
+            torch.from_numpy(box["size"]).float() * float(_WAYMO_DYNAMIC_MASK_SCALE)
+            + float(box_pad_m) * 2.0
+        )
         yaw = float(box["yaw"])
         rot = torch.tensor(
             [
@@ -395,7 +475,7 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
         dtype=np.float32,
     )
 
-    cam_cache_dir = os.path.join(base_dir, f"cache_cam{camera_id}_s{scale}_v3")
+    cam_cache_dir = os.path.join(base_dir, f"cache_cam{camera_id}_s{scale}_v5_segmask_camimagepose")
     os.makedirs(cam_cache_dir, exist_ok=True)
 
     cameras: Dict[int, Camera] = {}
@@ -439,14 +519,27 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
 
             dynamic_ids, _dynamic_boxes = _collect_waymo_dynamic_label_ids(frame_data)
 
-            ego2world = torch.tensor(
-                list(frame_data.pose.transform), dtype=torch.float32
-            ).reshape(4, 4)
-            # Centre on the first frame's ego position (same shift as load_waymo_raw).
-            ego2world = ego2world.clone()
-            ego2world[:3, 3] -= world_origin
+            # Decode JPEG image and read the per-image vehicle pose. Waymo stores
+            # CameraImage.pose at the camera timestamp; using frame.pose is only
+            # exact for some cameras/segments and can introduce 10–50 cm errors
+            # on side cameras.
+            img_bytes = None
+            image_pose = None
+            for img in frame_data.images:
+                if img.name == camera_id:
+                    img_bytes = bytes(img.image)
+                    image_pose = torch.tensor(
+                        list(img.pose.transform), dtype=torch.float32
+                    ).reshape(4, 4)
+                    break
+            if img_bytes is None:
+                continue
+            if image_pose is None:
+                continue
 
-            cam2world_waymo = ego2world @ cam2ego  # (4, 4)
+            image_pose = image_pose.clone()
+            image_pose[:3, 3] -= world_origin
+            cam2world_waymo = image_pose @ cam2ego  # (4, 4)
             # Convert to OpenCV camera convention (z-forward)
             cam2world = cam2world_waymo.clone()
             cam2world[:3, :3] = cam2world_waymo[:3, :3] @ R_wc2oc.T
@@ -455,14 +548,6 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
             R = cam2world[:3, :3].clone()
             T = -R.T @ cam2world[:3, 3]
 
-            # Decode JPEG image
-            img_bytes = None
-            for img in frame_data.images:
-                if img.name == camera_id:
-                    img_bytes = bytes(img.image)
-                    break
-            if img_bytes is None:
-                continue
             img_rgb = tf.io.decode_jpeg(img_bytes, channels=3).numpy()
             if scale != 1:
                 img_rgb = cv2.resize(img_rgb, (W, H), interpolation=cv2.INTER_AREA)
