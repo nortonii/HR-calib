@@ -1,0 +1,4 @@
+parent_config: "configs/waymo/static/segment_1005_cam4.yaml"
+
+scene_id: waymo_segment_1005_cam4_synced
+waymo_use_camera_pose_for_lidar: true

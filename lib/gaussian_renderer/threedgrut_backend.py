@@ -1,13 +1,10 @@
 import importlib
 import importlib.util
-import io
 import math
 import os
 import shutil
 import sys
-import tarfile
 import types
-import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,9 +18,6 @@ from lib.utils.graphics_utils import camera_to_rays
 
 
 _THREEDGRUT_COMMIT = "6f2176b1d8b837e556ff7c8b40bbba354c9945a4"
-_THREEDGRUT_URL = f"https://codeload.github.com/nv-tlabs/3dgrut/tar.gz/{_THREEDGRUT_COMMIT}"
-_OPTIX_DEV_URL = "https://codeload.github.com/NVIDIA/optix-dev/tar.gz/refs/tags/v7.5.0"
-_TCNN_URL = "https://codeload.github.com/NVlabs/tiny-cuda-nn/tar.gz/refs/heads/master"
 _TRACER_CACHE = {}
 
 
@@ -36,37 +30,6 @@ def _cache_root() -> Path:
 
 def _torch_extensions_dir() -> Path:
     return _cache_root() / "torch_extensions"
-
-
-def _download_file(url: str, out_path: Path) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    with urllib.request.urlopen(url) as response, open(tmp_path, "wb") as f:
-        shutil.copyfileobj(response, f)
-    tmp_path.replace(out_path)
-
-
-def _safe_extract_tarball(tar_path: Path, dest_dir: Path) -> None:
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(tar_path, "r:gz") as archive:
-        members = archive.getmembers()
-        for member in members:
-            parts = Path(member.name).parts
-            if len(parts) <= 1:
-                continue
-            relative = Path(*parts[1:])
-            if not relative.parts:
-                continue
-            target = dest_dir / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            src = archive.extractfile(member)
-            if src is None:
-                continue
-            with src, open(target, "wb") as f:
-                shutil.copyfileobj(src, f)
 
 
 def _is_valid_source_tree(source_dir: Path) -> bool:
@@ -92,36 +55,14 @@ def _ensure_source_tree() -> Path:
             marker.unlink()
         except OSError:
             pass
+    if _is_valid_source_tree(source_dir):
+        marker.write_text("ok\n", encoding="utf-8")
+        return source_dir
 
-    archive_dir = cache_root / "archives"
-    main_archive = archive_dir / f"3dgrut-{_THREEDGRUT_COMMIT}.tar.gz"
-    optix_archive = archive_dir / "optix-dev-v7.5.0.tar.gz"
-    tcnn_archive = archive_dir / "tiny-cuda-nn-master.tar.gz"
-
-    if not main_archive.exists():
-        _download_file(_THREEDGRUT_URL, main_archive)
-    if not optix_archive.exists():
-        _download_file(_OPTIX_DEV_URL, optix_archive)
-    if not tcnn_archive.exists():
-        _download_file(_TCNN_URL, tcnn_archive)
-
-    if source_dir.exists():
-        shutil.rmtree(source_dir)
-    source_dir.mkdir(parents=True, exist_ok=True)
-    _safe_extract_tarball(main_archive, source_dir)
-
-    optix_dir = source_dir / "threedgrt_tracer" / "dependencies" / "optix-dev"
-    if not optix_dir.exists() or not any(optix_dir.iterdir()):
-        optix_dir.mkdir(parents=True, exist_ok=True)
-        _safe_extract_tarball(optix_archive, optix_dir)
-
-    tcnn_dir = source_dir / "thirdparty" / "tiny-cuda-nn"
-    if not tcnn_dir.exists() or not any(tcnn_dir.iterdir()):
-        tcnn_dir.mkdir(parents=True, exist_ok=True)
-        _safe_extract_tarball(tcnn_archive, tcnn_dir)
-
-    marker.write_text("ok\n", encoding="utf-8")
-    return source_dir
+    raise RuntimeError(
+        "Missing local 3DGRUT source tree. Automatic downloads have been removed; "
+        f"populate {_cache_root() / 'source'} manually before running the 3DGRUT backend."
+    )
 
 
 def _install_ncore_shim_if_missing() -> None:

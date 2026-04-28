@@ -49,6 +49,114 @@ def decompress_matrix_int32(compressed):
     return matrix_tensor
 
 
+def _waymo_rpy_to_rotation_matrix(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+    """Convert Waymo per-pixel [roll, pitch, yaw] to rotation matrices."""
+    cos_r, sin_r = torch.cos(roll), torch.sin(roll)
+    cos_p, sin_p = torch.cos(pitch), torch.sin(pitch)
+    cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+
+    one = torch.ones_like(roll)
+    zero = torch.zeros_like(roll)
+
+    rot_roll = torch.stack(
+        [
+            torch.stack([one, zero, zero], dim=-1),
+            torch.stack([zero, cos_r, -sin_r], dim=-1),
+            torch.stack([zero, sin_r, cos_r], dim=-1),
+        ],
+        dim=-2,
+    )
+    rot_pitch = torch.stack(
+        [
+            torch.stack([cos_p, zero, sin_p], dim=-1),
+            torch.stack([zero, one, zero], dim=-1),
+            torch.stack([-sin_p, zero, cos_p], dim=-1),
+        ],
+        dim=-2,
+    )
+    rot_yaw = torch.stack(
+        [
+            torch.stack([cos_y, -sin_y, zero], dim=-1),
+            torch.stack([sin_y, cos_y, zero], dim=-1),
+            torch.stack([zero, zero, one], dim=-1),
+        ],
+        dim=-2,
+    )
+    return rot_yaw @ (rot_pitch @ rot_roll)
+
+
+def _compute_waymo_sensor_frame_rays(
+    beam_inclinations,
+    sensor2ego: torch.Tensor,
+    height: int,
+    width: int,
+    pixel_offset: float = 0.5,
+) -> torch.Tensor:
+    """Return unit ray directions in the LiDAR sensor frame for a Waymo range image."""
+    x = (torch.arange(width, 0, -1, dtype=torch.float32) - float(pixel_offset)) / float(width)
+    azimuth = x * 2.0 * torch.pi - torch.pi
+    angle_offset = torch.atan2(sensor2ego[1, 0], sensor2ego[0, 0]).float()
+    azimuth = azimuth - angle_offset
+
+    if isinstance(beam_inclinations, (list, tuple)) and len(beam_inclinations) == 2:
+        rows = (
+            torch.arange(height, 0, -1, dtype=torch.float32) - float(pixel_offset)
+        ) / float(height)
+        inclination = rows * float(beam_inclinations[1] - beam_inclinations[0]) + float(beam_inclinations[0])
+    else:
+        inclination = torch.as_tensor(beam_inclinations, dtype=torch.float32)
+        if inclination.ndim != 1 or inclination.numel() != height:
+            raise ValueError(
+                f"Waymo beam inclinations must provide H={height} values, got {tuple(inclination.shape)}"
+            )
+        if torch.max(torch.abs(inclination)) > (torch.pi + 1.0e-3):
+            inclination = torch.deg2rad(inclination)
+        inclination = inclination.flip(0)
+
+    inclination = inclination.view(height, 1)
+    azimuth = azimuth.view(1, width)
+    rays_x = torch.cos(inclination) * torch.cos(azimuth)
+    rays_y = torch.cos(inclination) * torch.sin(azimuth)
+    rays_z = torch.sin(inclination).expand(height, width)
+    rays = torch.stack([rays_x.expand(height, width), rays_y.expand(height, width), rays_z], dim=-1)
+    rays = rays / torch.clamp(torch.norm(rays, dim=-1, keepdim=True), min=1.0e-8)
+    return rays
+
+
+def _build_waymo_top_lidar_pixel_rays(
+    range_image_pose: torch.Tensor,
+    world_origin: torch.Tensor,
+    sensor2ego: torch.Tensor,
+    beam_inclinations,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert Waymo top-lidar per-pixel poses to world-space ray origins/directions."""
+    if range_image_pose.ndim != 3 or range_image_pose.shape[-1] != 6:
+        raise ValueError(
+            f"Waymo range_image_pose must have shape (H, W, 6), got {tuple(range_image_pose.shape)}"
+        )
+
+    height, width, _ = range_image_pose.shape
+    local_rays = _compute_waymo_sensor_frame_rays(
+        beam_inclinations=beam_inclinations,
+        sensor2ego=sensor2ego,
+        height=height,
+        width=width,
+    )
+
+    roll = range_image_pose[..., 0]
+    pitch = range_image_pose[..., 1]
+    yaw = range_image_pose[..., 2]
+    vehicle_translation = range_image_pose[..., 3:].clone()
+    vehicle_translation = vehicle_translation - world_origin.view(1, 1, 3)
+
+    vehicle_rotation = _waymo_rpy_to_rotation_matrix(roll, pitch, yaw)
+    sensor_rotation = torch.einsum("...ij,jk->...ik", vehicle_rotation, sensor2ego[:3, :3].float())
+    sensor_center = torch.einsum("...ij,j->...i", vehicle_rotation, sensor2ego[:3, 3].float()) + vehicle_translation
+    world_rays = torch.einsum("...ij,...j->...i", sensor_rotation, local_rays)
+    world_rays = world_rays / torch.clamp(torch.norm(world_rays, dim=-1, keepdim=True), min=1.0e-8)
+    return sensor_center, world_rays
+
+
 _WAYMO_DYNAMIC_LABEL_TYPES = {
     label_pb2.Label.TYPE_VEHICLE,
     label_pb2.Label.TYPE_PEDESTRIAN,
@@ -88,6 +196,15 @@ def _waymo_dynamic_id_variants(dynamic_ids: set[str]) -> set[str]:
         except ValueError:
             pass
     return variants
+
+
+def _get_waymo_image_pose(frame_data, camera_id: int) -> torch.Tensor | None:
+    for image in frame_data.images:
+        if int(image.name) == int(camera_id):
+            return torch.tensor(
+                list(image.pose.transform), dtype=torch.float32
+            ).reshape(4, 4)
+    return None
 
 
 def _collect_waymo_dynamic_label_ids(frame_data, speed_threshold_mps: float = 0.5):
@@ -272,6 +389,14 @@ def _build_waymo_range_dynamic_mask(
 
 
 def load_waymo_raw(base_dir, args):
+    selected_camera_id = int(getattr(args, "waymo_camera_id", 1))
+    use_camera_pose_for_lidar = bool(
+        getattr(args, "waymo_use_camera_pose_for_lidar", True)
+    )
+    use_top_range_image_pose = bool(
+        getattr(args, "waymo_use_top_range_image_pose", True)
+    )
+
     for filename in os.listdir(base_dir):
         if filename.endswith(".tfrecord"):
             fp = os.path.join(base_dir, filename)
@@ -288,12 +413,19 @@ def load_waymo_raw(base_dir, args):
     first_record = dataset[args.frame_length[0]]
     first_frame_data = dataset_pb2.Frame()
     first_frame_data.ParseFromString(bytearray(first_record.numpy()))
-    world_origin = torch.tensor(
-        first_frame_data.pose.transform, dtype=torch.float32
-    ).reshape(4, 4)[:3, 3].clone()
+    if use_camera_pose_for_lidar:
+        first_pose = _get_waymo_image_pose(first_frame_data, selected_camera_id)
+    else:
+        first_pose = None
+    if first_pose is None:
+        first_pose = torch.tensor(
+            first_frame_data.pose.transform, dtype=torch.float32
+        ).reshape(4, 4)
+    world_origin = first_pose[:3, 3].clone()
 
     # Persist origin so load_waymo_cameras can use the same reference.
-    cache_dir = os.path.join(base_dir, "cache")
+    cache_tag = "camrigid" if not use_top_range_image_pose else "toprangev1"
+    cache_dir = os.path.join(base_dir, f"cache_{cache_tag}")
     os.makedirs(cache_dir, exist_ok=True)
     torch.save(world_origin, os.path.join(cache_dir, "world_origin.pt"))
 
@@ -329,16 +461,21 @@ def load_waymo_raw(base_dir, args):
                     data_type=args.data_type,
                 )
 
-            ego2world = torch.tensor(
-                frame_data.pose.transform, dtype=torch.float32
-            ).reshape(4, 4)
+            if use_camera_pose_for_lidar:
+                ego2world = _get_waymo_image_pose(frame_data, selected_camera_id)
+            else:
+                ego2world = None
+            if ego2world is None:
+                ego2world = torch.tensor(
+                    frame_data.pose.transform, dtype=torch.float32
+                ).reshape(4, 4)
             # Subtract world origin so all positions are relative to first frame.
             ego2world = ego2world.clone()
             ego2world[:3, 3] -= world_origin
 
             dynamic_ids, dynamic_boxes = _collect_waymo_dynamic_label_ids(frame_data)
 
-            decompressed_dir = f"{base_dir}/cache"
+            decompressed_dir = cache_dir
             os.makedirs(decompressed_dir, exist_ok=True)
             decompressed_path = os.path.join(
                 decompressed_dir, f"decompressed_frame_{frame}_sensor_{name}.pt"
@@ -346,6 +483,10 @@ def load_waymo_raw(base_dir, args):
             dynamic_mask_path = os.path.join(
                 decompressed_dir, f"dynamic_mask_frame_{frame}_sensor_{name}.pt"
             )
+            pixel_rays_path = os.path.join(
+                decompressed_dir, f"pixel_rays_frame_{frame}_sensor_{name}.pt"
+            )
+            top_range_pose_r1 = None
             if os.path.exists(decompressed_path):
                 range_image_r1, range_image_r2 = torch.load(decompressed_path)
             else:
@@ -361,10 +502,48 @@ def load_waymo_raw(base_dir, args):
                             range_image_r1[..., 1], max=1
                         )
                         range_image_r1[..., 0:2][range_image_r1[..., 0:2] == -1] = 0
+                        if (
+                            use_top_range_image_pose
+                            and name == 1
+                            and lidar_data.ri_return1.range_image_pose_compressed
+                        ):
+                            top_range_pose_r1 = decompress_range_image(
+                                lidar_data.ri_return1.range_image_pose_compressed
+                            )
                 torch.save((range_image_r1, range_image_r2), decompressed_path)
 
+            ray_origin = None
+            ray_direction = None
+            if use_top_range_image_pose and name == 1:
+                if os.path.exists(pixel_rays_path):
+                    ray_origin, ray_direction = torch.load(pixel_rays_path)
+                else:
+                    if top_range_pose_r1 is None:
+                        for lidar_data in frame_data.lasers:
+                            if (
+                                lidar_data.name == name
+                                and lidar_data.ri_return1.range_image_pose_compressed
+                            ):
+                                top_range_pose_r1 = decompress_range_image(
+                                    lidar_data.ri_return1.range_image_pose_compressed
+                                )
+                                break
+                    if top_range_pose_r1 is not None:
+                        ray_origin, ray_direction = _build_waymo_top_lidar_pixel_rays(
+                            range_image_pose=top_range_pose_r1.float(),
+                            world_origin=world_origin.float(),
+                            sensor2ego=lidar.sensor2ego.float(),
+                            beam_inclinations=lidar.inclination_bounds,
+                        )
+                        torch.save((ray_origin.cpu(), ray_direction.cpu()), pixel_rays_path)
+
             lidar.add_frame(
-                frame=frame, ego2world=ego2world, r1=range_image_r1, r2=range_image_r2
+                frame=frame,
+                ego2world=ego2world,
+                r1=range_image_r1,
+                r2=range_image_r2,
+                ray_origin=ray_origin,
+                ray_direction=ray_direction,
             )
             if os.path.exists(dynamic_mask_path):
                 dynamic_mask_r1, dynamic_mask_r2 = torch.load(dynamic_mask_path)
@@ -475,9 +654,6 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
         dtype=np.float32,
     )
 
-    cam_cache_dir = os.path.join(base_dir, f"cache_cam{camera_id}_s{scale}_v5_segmask_camimagepose")
-    os.makedirs(cam_cache_dir, exist_ok=True)
-
     cameras: Dict[int, Camera] = {}
     images: Dict[int, torch.Tensor] = {}
 
@@ -495,7 +671,11 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
 
     # Load the world origin saved by load_waymo_raw for consistent centering.
     # If not found (e.g. cache was cleared), compute it from the first frame.
-    world_origin_path = os.path.join(base_dir, "cache", "world_origin.pt")
+    use_top_range_image_pose = bool(
+        getattr(args, "waymo_use_top_range_image_pose", True)
+    )
+    cache_tag = "camrigid" if not use_top_range_image_pose else "toprangev1"
+    world_origin_path = os.path.join(base_dir, f"cache_{cache_tag}", "world_origin.pt")
     if os.path.exists(world_origin_path):
         world_origin = torch.load(world_origin_path)
     else:
@@ -506,10 +686,29 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
             list(ref_frame_data.pose.transform), dtype=torch.float32
         ).reshape(4, 4)[:3, 3].clone()
 
+    use_camera_image_pose = not bool(
+        getattr(args, "waymo_use_frame_pose_for_camera", False)
+    )
+    pose_cache_tag = "camimagepose" if use_camera_image_pose else "framepose"
+    cam_cache_dir = os.path.join(
+        base_dir,
+        f"cache_cam{camera_id}_s{scale}_v7_segmask_{pose_cache_tag}_{cache_tag}",
+    )
+    os.makedirs(cam_cache_dir, exist_ok=True)
+
     for frame in range(args.frame_length[0], args.frame_length[1] + 1):
         cache_path = os.path.join(cam_cache_dir, f"frame_{frame}.pt")
+        cached = None
         if os.path.exists(cache_path):
-            cached = torch.load(cache_path)
+            try:
+                cached = torch.load(cache_path)
+            except Exception:
+                try:
+                    os.remove(cache_path)
+                except OSError:
+                    pass
+                cached = None
+        if cached is not None:
             R, T, image_tensor = cached["R"], cached["T"], cached["image"]
             supervision_mask = cached.get("supervision_mask")
         else:
@@ -537,9 +736,19 @@ def load_waymo_cameras(base_dir, args, camera_id=1, scale=4):
             if image_pose is None:
                 continue
 
-            image_pose = image_pose.clone()
-            image_pose[:3, 3] -= world_origin
-            cam2world_waymo = image_pose @ cam2ego  # (4, 4)
+            frame_pose = torch.tensor(
+                list(frame_data.pose.transform), dtype=torch.float32
+            ).reshape(4, 4)
+            frame_pose = frame_pose.clone()
+            frame_pose[:3, 3] -= world_origin
+
+            if use_camera_image_pose:
+                ego_or_cam_pose = image_pose.clone()
+                ego_or_cam_pose[:3, 3] -= world_origin
+            else:
+                ego_or_cam_pose = frame_pose
+
+            cam2world_waymo = ego_or_cam_pose @ cam2ego  # (4, 4)
             # Convert to OpenCV camera convention (z-forward)
             cam2world = cam2world_waymo.clone()
             cam2world[:3, :3] = cam2world_waymo[:3, :3] @ R_wc2oc.T

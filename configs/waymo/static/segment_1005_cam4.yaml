@@ -1,0 +1,4 @@
+parent_config: "configs/waymo/static/segment_1005.yaml"
+
+scene_id: waymo_segment_1005_cam4
+waymo_camera_id: 4
