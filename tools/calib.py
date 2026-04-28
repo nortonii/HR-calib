@@ -116,6 +116,7 @@ from lib.utils.rgbd_calibration import (
     select_match_points,
     stratify_frame_data_by_depth,
 )
+from lib.utils.system_utils import set_seed
 
 
 DEFAULT_OUTPUT_ROOT = os.environ.get("HR_TINY_OUTPUT_ROOT", "/mnt/xzy/hr-tiny-output")
@@ -4135,6 +4136,8 @@ def run_noise_inject_calib(
     freeze_gaussians_after_cycle: int = 0,
     pose_step_at_cycle_end: bool = False,
     pose_step_interval_iters: int = 0,
+    rebase_pose_after_initial_pure_pnp: bool = False,
+    restore_best_pose_metric: str = "translation",
     matcher_adjacent_support: bool = False,
     matcher_adjacent_max_offset: int = 1,
     matcher_support_radius_px: float = 6.0,
@@ -4148,6 +4151,7 @@ def run_noise_inject_calib(
     matcher_dense_cert_threshold: float = 0.02,
     matcher_dense_color_cert_threshold: float | None = None,
     match_once_per_cycle: bool = True,
+    camera_supervision_exp_decay_gamma: float = 1.0,
     cross_frame_weight: float = 0.0,
     flow_proj_weight: float = 0.0,
     flow_proj_max_offset: int = 1,
@@ -4377,6 +4381,20 @@ def run_noise_inject_calib(
         _flush_pure_pnp_history()
         return record
 
+    def _get_pure_pnp_frame_ids() -> list[int]:
+        pure_pnp_frame_ids = sorted(cam_cameras.keys())
+        if pure_pnp_drop_first_n_frames > 0:
+            pure_pnp_frame_ids = pure_pnp_frame_ids[int(pure_pnp_drop_first_n_frames):]
+        if pure_pnp_drop_last_n_frames > 0:
+            keep_count = max(0, len(pure_pnp_frame_ids) - int(pure_pnp_drop_last_n_frames))
+            pure_pnp_frame_ids = pure_pnp_frame_ids[:keep_count]
+        if not pure_pnp_frame_ids:
+            raise ValueError(
+                "pure_pnp frame trimming removed all frames; "
+                "reduce --pure_pnp_drop_first_n_frames / --pure_pnp_drop_last_n_frames."
+            )
+        return pure_pnp_frame_ids
+
     def _run_pure_pnp_phase(
         *,
         phase: str,
@@ -4391,17 +4409,7 @@ def run_noise_inject_calib(
                 f"running {num_steps} iterative PnP steps..."
             )
         )
-        pure_pnp_frame_ids = sorted(cam_cameras.keys())
-        if pure_pnp_drop_first_n_frames > 0:
-            pure_pnp_frame_ids = pure_pnp_frame_ids[int(pure_pnp_drop_first_n_frames):]
-        if pure_pnp_drop_last_n_frames > 0:
-            keep_count = max(0, len(pure_pnp_frame_ids) - int(pure_pnp_drop_last_n_frames))
-            pure_pnp_frame_ids = pure_pnp_frame_ids[:keep_count]
-        if not pure_pnp_frame_ids:
-            raise ValueError(
-                "pure_pnp frame trimming removed all frames; "
-                "reduce --pure_pnp_drop_first_n_frames / --pure_pnp_drop_last_n_frames."
-            )
+        pure_pnp_frame_ids = _get_pure_pnp_frame_ids()
         if pure_pnp_drop_first_n_frames > 0 or pure_pnp_drop_last_n_frames > 0:
             print(
                 blue(
@@ -4550,9 +4558,25 @@ def run_noise_inject_calib(
             print(blue("[NoiseInject] Cycle checkpoint loaded in scene-only mode — pose/init state kept from current run"))
         else:
             if "pose_correction_state" in resume_ckpt:
-                pose_correction.load_state_dict(
-                    {k: v.to("cuda") for k, v in resume_ckpt["pose_correction_state"].items()}
+                pose_state = {k: v.to("cuda") for k, v in resume_ckpt["pose_correction_state"].items()}
+                missing_keys, unexpected_keys = pose_correction.load_state_dict(
+                    pose_state,
+                    strict=False,
                 )
+                if missing_keys:
+                    print(
+                        blue(
+                            "[NoiseInject] Resume pose state missing keys — "
+                            + ", ".join(missing_keys)
+                        )
+                    )
+                if unexpected_keys:
+                    print(
+                        blue(
+                            "[NoiseInject] Resume pose state has unexpected keys — "
+                            + ", ".join(unexpected_keys)
+                        )
+                    )
             else:
                 pose_correction.delta_rotations_quat.data.copy_(
                     resume_ckpt["delta_rotations_quat"].to("cuda")
@@ -4760,6 +4784,13 @@ def run_noise_inject_calib(
         print(blue(f"[NoiseInject] LiDAR warmup enabled for first {warmup_cycles} cycles (camera-side supervision disabled, pose frozen)"))
     if color_warmup_cycles > 0:
         print(blue(f"[NoiseInject] Color warmup enabled for first {color_warmup_cycles} cycles (RGB losses update colors only)"))
+    if camera_supervision_exp_decay_gamma < 1.0:
+        print(
+            blue(
+                "[NoiseInject] Camera-side supervision exponential decay enabled "
+                f"after color warmup: gamma={camera_supervision_exp_decay_gamma:.4f}"
+            )
+        )
     if disable_depth_during_color_warmup:
         print(blue("[NoiseInject] LiDAR depth supervision disabled during color warmup"))
     if geometry_conflict_policy != "none":
@@ -4970,9 +5001,14 @@ def run_noise_inject_calib(
     loss_cross_frame_accum = 0.0
     loss_flow_proj_accum = 0.0
     loss_reg_accum = 0.0
-    # Best-T tracking: save the delta_T that achieved the lowest T_err
+    # Track the best translation snapshot and the best rotation snapshot separately.
     best_T_err     = float("inf")
     best_delta_T   = pose_correction.delta_translations.data.clone()
+    best_rot_err   = float("inf")
+    best_pose_state = {
+        k: v.detach().cpu().clone()
+        for k, v in pose_correction.state_dict().items()
+    }
     start_cycle    = 1
     pose_lr_drop_applied = False
     translation_lr_drop_applied = False
@@ -4983,11 +5019,19 @@ def run_noise_inject_calib(
         gaussian_iter = resume_ckpt["global_iter"]
         best_T_err    = resume_ckpt["best_T_err"]
         best_delta_T  = resume_ckpt["best_delta_T"].to("cuda")
+        best_rot_err  = float(resume_ckpt.get("best_rot_err", best_rot_err))
+        if "best_pose_state" in resume_ckpt:
+            best_pose_state = {
+                k: v.detach().cpu().clone()
+                for k, v in resume_ckpt["best_pose_state"].items()
+            }
         stage2_active = resume_ckpt["stage2_active"]
         start_cycle   = resume_ckpt["cycle"] + 1
         print(blue(f"[NoiseInject] Resumed: start_cycle={start_cycle}, "
-                   f"stage2_active={stage2_active}, best_T_err={best_T_err:.4f}m"))
+                   f"stage2_active={stage2_active}, best_T_err={best_T_err:.4f}m, best_rot_err={best_rot_err:.4f}°"))
 
+    raw_final_err = init_err
+    raw_final_T_err = init_T_err
     for cycle in range(start_cycle, total_cycles + 1):
         # ── Stage transition: enable translation at translation_start_cycle ──
         if two_stage and not stage2_active and cycle > translation_start_cycle:
@@ -5063,6 +5107,9 @@ def run_noise_inject_calib(
                     f"rot_err={_rotation_error_deg(_effective_R(pose_correction), gt_l2c_R):.4f}°"
                 )
             )
+            if rebase_pose_after_initial_pure_pnp:
+                pose_correction.rebase_shared_lidar_to_camera(_get_pure_pnp_frame_ids()[0])
+                print(blue("[PurePnP] Rebased shared LiDAR-camera pose to the initial PurePnP solution."))
             run_initial_pure_pnp_after_warmup = False
             if periodic_pure_pnp_interval_cycles <= 0:
                 return _effective_R(pose_correction)
@@ -5070,6 +5117,10 @@ def run_noise_inject_calib(
         # ── Per-cycle match precomputation ────────────────────
         lidar_warmup_active = bool(warmup_cycles > 0 and cycle <= warmup_cycles)
         warmup_active_now = bool(color_warmup_cycles > 0 and cycle <= color_warmup_cycles)
+        camera_supervision_scale = 1.0
+        if camera_supervision_exp_decay_gamma < 1.0 and cycle > color_warmup_cycles:
+            decay_steps = max(int(cycle - color_warmup_cycles - 1), 0)
+            camera_supervision_scale = float(camera_supervision_exp_decay_gamma) ** decay_steps
         if blurred_cam_images is not None:
             current_cam_images = (
                 blurred_cam_images
@@ -5284,7 +5335,11 @@ def run_noise_inject_calib(
                                 + float(lambda_dssim) * (1.0 - ssim(pred_chw, gt_chw))
                             )
                     if float(lambda_rgb) > 0.0 and base_rgb_photo_loss is not None:
-                        loss_rgb = float(lambda_rgb) * base_rgb_photo_loss
+                        loss_rgb = (
+                            float(lambda_rgb)
+                            * float(camera_supervision_scale)
+                            * base_rgb_photo_loss
+                        )
                     psnr_accum += psnr(pred_chw, gt_chw).item()
                     psnr_count += 1
                 if matcher_color_supervision:
@@ -5355,7 +5410,12 @@ def run_noise_inject_calib(
                         supervised_ratio = 1.0
                         if matcher_color_summary is not None:
                             supervised_ratio = float(matcher_color_summary.get("supervised_ratio", 1.0))
-                        loss_rgb_reg = float(post_warmup_rgb_reg_scale) * supervised_ratio * base_rgb_photo_loss
+                        loss_rgb_reg = (
+                            float(post_warmup_rgb_reg_scale)
+                            * float(camera_supervision_scale)
+                            * supervised_ratio
+                            * base_rgb_photo_loss
+                        )
                 if matcher_adjacent_color_supervision and int(cam_render.get("num_visible", 0)) > 0:
                     if match_once_per_cycle and adj_gt_cache:
                         loss_match_adjacent, _ = _apply_adjacent_cache_loss(
@@ -5431,6 +5491,13 @@ def run_noise_inject_calib(
                 loss_reg = float(lambda_reg) * reg_term
             if apply_other_regularizers and loss_normal.numel() > 0:
                 loss_reg = loss_reg + loss_normal
+            if apply_other_regularizers:
+                pose_reg = pose_correction.regularization_loss(int(frame))
+                if not torch.is_tensor(pose_reg):
+                    pose_reg = torch.tensor(float(pose_reg), device=loss_depth.device, dtype=loss_depth.dtype)
+                else:
+                    pose_reg = pose_reg.to(device=loss_depth.device, dtype=loss_depth.dtype)
+                loss_reg = loss_reg + pose_reg
             loss_reg = loss_reg + loss_camera_depth_normal
 
             total_loss = loss_depth + loss_rgb + loss_match_color + loss_match_adjacent + loss_rgb_reg + loss_reg
@@ -5466,7 +5533,7 @@ def run_noise_inject_calib(
                         fy=_fy,
                         cx=_cx,
                         cy=_cy,
-                        weight=cross_frame_weight,
+                        weight=float(cross_frame_weight) * float(camera_supervision_scale),
                     )
 
             # ── Flow projection loss ──────────────────────────────────────────────
@@ -5501,7 +5568,7 @@ def run_noise_inject_calib(
                         fy=_fy_fp,
                         cx=_cx_fp,
                         cy=_cy_fp,
-                        weight=flow_proj_weight,
+                        weight=float(flow_proj_weight) * float(camera_supervision_scale),
                     )
                 merged_geometry_grads = None
                 geometry_named_params = []
@@ -5715,6 +5782,8 @@ def run_noise_inject_calib(
         eff_R    = _effective_R(pose_correction)
         rot_err  = _rotation_error_deg(eff_R, gt_l2c_R)
         T_err    = _translation_error_m(pose_correction, gt_l2c_T)
+        raw_final_err = rot_err
+        raw_final_T_err = T_err
         avg_psnr = psnr_accum / psnr_count if psnr_count > 0 else 0.0
         avg_loss  = loss_accum       / iters_per_cycle
         avg_depth = loss_depth_accum / iters_per_cycle
@@ -5739,6 +5808,12 @@ def run_noise_inject_calib(
         if T_err < best_T_err:
             best_T_err = T_err
             best_delta_T = pose_correction.delta_translations.data.clone()
+        if rot_err < best_rot_err:
+            best_rot_err = rot_err
+            best_pose_state = {
+                k: v.detach().cpu().clone()
+                for k, v in pose_correction.state_dict().items()
+            }
 
         if (
             pose_lr_drop_cycle > 0
@@ -5828,6 +5903,8 @@ def run_noise_inject_calib(
                 "global_iter":          global_iter,
                 "best_T_err":           best_T_err,
                 "best_delta_T":         best_delta_T.cpu(),
+                "best_rot_err":         best_rot_err,
+                "best_pose_state":      best_pose_state,
                 "stage2_active":        stage2_active,
                 "delta_rotations_quat": pose_correction.delta_rotations_quat.data.cpu(),
                 "delta_translations":   pose_correction.delta_translations.data.cpu(),
@@ -5858,15 +5935,23 @@ def run_noise_inject_calib(
                     pass
             print(blue(f"  [ckpt] saved cycle checkpoint → {ckpt_path}"))
 
-    # Restore best translation
+    print(green(f"[NoiseInject] Raw final cycle pose : rot={raw_final_err:.4f}°   trans={raw_final_T_err:.4f} m"))
+
+    # Restore whichever metric matters for this run.
     with torch.no_grad():
-        pose_correction.delta_translations.copy_(best_delta_T)
+        if str(restore_best_pose_metric).lower() == "rotation":
+            pose_correction.load_state_dict(
+                {k: v.to("cuda") for k, v in best_pose_state.items()},
+                strict=False,
+            )
+        else:
+            pose_correction.delta_translations.copy_(best_delta_T)
 
     final_R     = _effective_R(pose_correction)
     final_err   = _rotation_error_deg(final_R, gt_l2c_R)
     final_T_err = _translation_error_m(pose_correction, gt_l2c_T)
     print(green(f"\n[NoiseInject] Init  rot : {init_err:.4f}°   trans: {init_T_err:.4f} m"))
-    print(green(f"[NoiseInject] Final rot : {final_err:.4f}°   trans: {final_T_err:.4f} m  (best T={best_T_err:.4f} m)"))
+    print(green(f"[NoiseInject] Final rot : {final_err:.4f}°   trans: {final_T_err:.4f} m  (best T={best_T_err:.4f} m, best R={best_rot_err:.4f}°)"))
     print(green(f"[NoiseInject] Rot improvement : {init_err - final_err:+.4f}°"))
     print(green(f"[NoiseInject] Trans improvement: {init_T_err - final_T_err:+.4f} m"))
     return final_R
@@ -5937,8 +6022,8 @@ def main():
                         help="Multiplicative factor for the one-time late-stage translation LR drop.")
     parser.add_argument("--use_gt_translation",  action="store_true",
                         help="Lock translation to GT (skip translation optimisation).")
-    parser.add_argument("--translation_lr",      type=float, default=0.0015,
-                        help="Learning rate for delta_translations (default: 0.0015)")
+    parser.add_argument("--translation_lr",      type=float, default=None,
+                        help="Learning rate for delta_translations. Defaults to model.pose_correction.translation_lr, or 0.0015 if unset.")
     parser.add_argument("--resume_from",         default=None,
                         help="Path to best_rotation.npz from a previous run; "
                              "use its final_R as starting rotation (overrides --init_rot_deg)")
@@ -5995,6 +6080,15 @@ def main():
                         help="Accumulate pose gradients within a cycle and update pose once at the end of that cycle.")
     parser.add_argument("--pose_step_interval_iters", type=int, default=0,
                         help="If >0, step pose optimizer and fold extrinsics every N iterations after warmup, similar to HiGS-Calib's periodic pose updates.")
+    parser.add_argument("--rebase_pose_after_initial_pure_pnp", dest="rebase_pose_after_initial_pure_pnp",
+                        action="store_true", default=None,
+                        help="After the initial PurePnP phase, make the solved shared LiDAR-camera pose the new base pose before refine.")
+    parser.add_argument("--no-rebase_pose_after_initial_pure_pnp", dest="rebase_pose_after_initial_pure_pnp",
+                        action="store_false",
+                        help="Disable rebase after the initial PurePnP phase, overriding config defaults.")
+    parser.add_argument("--restore_best_pose_metric", type=str, default="translation",
+                        choices=["translation", "rotation"],
+                        help="Which metric to restore at the end of training for final reporting/output.")
     parser.add_argument("--matcher_adjacent_support", action="store_true",
                         help="Filter matcher correspondences by adjacent-frame RGB-RGB support.")
     parser.add_argument("--matcher_adjacent_max_offset", type=int, default=1,
@@ -6067,6 +6161,8 @@ def main():
                         help="Override the full-image camera RGB loss weight. Set to 0 to disable dense RGB supervision.")
     parser.add_argument("--lambda_dssim",           type=float, default=None,
                         help="Override the RGB DSSIM mixing weight. Defaults to exp config lambda_rgb_dssim.")
+    parser.add_argument("--camera_supervision_exp_decay_gamma", type=float, default=1.0,
+                        help="After color warmup, exponentially decay camera-side RGB/pose supervision each cycle by gamma^t. 1.0 disables decay.")
     parser.add_argument("--lambda_reg",             type=float, default=None,
                         help="Override the Gaussian box regularization weight. Defaults to exp config lambda_reg.")
     parser.add_argument("--geometry_conflict_policy", type=str, default="none",
@@ -6217,6 +6313,7 @@ def main():
                              "'lidar_rt'/'2dgs' for LiDAR=legacy lidar-rt + Camera=2DGS.")
     parser.add_argument("--output_dir",          default=None)
     parser.add_argument("--gpu",                 type=int, default=None)
+    parser.add_argument("--seed",                type=int, default=None)
     cli = parser.parse_args()
     if cli.pure_pnp_freeze_rotation and cli.pure_pnp_freeze_translation:
         parser.error("PurePnP cannot freeze both rotation and translation at the same time.")
@@ -6226,6 +6323,9 @@ def main():
 
     args = parse(cli.exp_config)
     args = parse(cli.data_config, args)
+    seed = int(cli.seed if cli.seed is not None else getattr(args, "seed", 0))
+    set_seed(seed)
+    print(blue(f"[Calib] Seed: {seed}"))
     render_preset = _normalize_render_preset(cli.render_preset)
     _dtype = str(getattr(args, "data_type", "")).lower()
     _dtype_norm = _dtype.replace("-", "").replace("_", "")
@@ -6400,6 +6500,16 @@ def main():
         cam_cameras, pose_cfg, lidar_poses=lidar_world_poses
     ).cuda()
     pose_correction.use_gt_translation = cli.use_gt_translation
+    cli_translation_lr = (
+        float(cli.translation_lr)
+        if cli.translation_lr is not None
+        else float(getattr(pose_cfg, "translation_lr", 0.0015))
+    )
+    cli_rebase_after_pnp = (
+        bool(cli.rebase_pose_after_initial_pure_pnp)
+        if cli.rebase_pose_after_initial_pure_pnp is not None
+        else bool(getattr(args, "rebase_pose_after_initial_pure_pnp", False))
+    )
 
     gt_l2c_R = pose_correction.gt_lidar_to_camera_rotation[0].float().cuda()
     gt_l2c_T = pose_correction.gt_lidar_to_camera_translation[0].float().cuda()
@@ -6488,7 +6598,7 @@ def main():
             total_cycles=cli.total_cycles,
             iters_per_cycle=cli.iters_per_cycle,
             rotation_lr=cli.rotation_lr,
-            translation_lr=cli.translation_lr,
+            translation_lr=cli_translation_lr,
             freeze_gaussians=cli.freeze_gaussians,
             freeze_xyz=cli.freeze_xyz,
             freeze_colors=cli.freeze_colors,
@@ -6508,6 +6618,7 @@ def main():
             translation_lr_drop_factor=cli.translation_lr_drop_factor,
             lambda_rgb=cli.lambda_rgb if cli.lambda_rgb is not None else float(getattr(args.opt, "lambda_rgb", 1.0)),
             lambda_dssim=cli.lambda_dssim if cli.lambda_dssim is not None else float(getattr(args.opt, "lambda_rgb_dssim", getattr(args.opt, "lambda_dssim", 0.2))),
+            camera_supervision_exp_decay_gamma=float(cli.camera_supervision_exp_decay_gamma),
             lambda_reg=cli.lambda_reg if cli.lambda_reg is not None else float(getattr(args.opt, "lambda_reg", 0.0)),
             geometry_conflict_policy=cli.geometry_conflict_policy,
             geometry_conflict_camera_weight=cli.geometry_conflict_camera_weight,
@@ -6537,6 +6648,8 @@ def main():
             freeze_gaussians_after_cycle=cli.freeze_gaussians_after_cycle,
             pose_step_at_cycle_end=cli.pose_step_at_cycle_end,
             pose_step_interval_iters=cli.pose_step_interval_iters,
+            rebase_pose_after_initial_pure_pnp=cli_rebase_after_pnp,
+            restore_best_pose_metric=cli.restore_best_pose_metric,
             matcher_adjacent_support=cli.matcher_adjacent_support,
             matcher_adjacent_max_offset=cli.matcher_adjacent_max_offset,
             matcher_support_radius_px=cli.matcher_support_radius_px,

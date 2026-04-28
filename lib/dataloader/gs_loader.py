@@ -108,12 +108,18 @@ class SceneLidar(Scene):
         lidar: Dict[int, LiDARSensor] = waymo_raw_pkg[0]
         bboxes: Dict[str, BoundingBox] = waymo_raw_pkg[1]
         frame_range = args.frame_length
-        eval_frames = args.eval_frames
-        train_frames = [
-            frame_id
-            for frame_id in range(frame_range[0], frame_range[1] + 1)
-            if frame_id not in eval_frames
-        ]
+        available_frame_ids = sorted(int(frame_id) for frame_id in lidar.raw_points_local.keys())
+        if available_frame_ids:
+            eval_frame_set = {int(frame_id) for frame_id in args.eval_frames}
+            eval_frames = [frame_id for frame_id in available_frame_ids if frame_id in eval_frame_set]
+            train_frames = [frame_id for frame_id in available_frame_ids if frame_id not in eval_frame_set]
+        else:
+            eval_frames = args.eval_frames
+            train_frames = [
+                frame_id
+                for frame_id in range(frame_range[0], frame_range[1] + 1)
+                if frame_id not in eval_frames
+            ]
 
         self.train_lidar = lidar
         self.train_lidar.set_frames(train_frames, eval_frames)
@@ -126,12 +132,14 @@ class SceneLidar(Scene):
             for obj_id in obj_ids:
                 bbox = bboxes[obj_id]
                 general_utils.fill_zeros_with_previous_nonzero(
-                    range(frame_range[0], frame_range[1] + 1), bbox.frame
+                    available_frame_ids if available_frame_ids else range(frame_range[0], frame_range[1] + 1),
+                    bbox.frame,
                 )
 
                 abs_velocities = []
-                for frame in range(frame_range[0], frame_range[1]):
-                    velocity = bbox.frame[frame + 1][0] - bbox.frame[frame][0]
+                velocity_frame_ids = available_frame_ids if available_frame_ids else list(range(frame_range[0], frame_range[1] + 1))
+                for frame, next_frame in zip(velocity_frame_ids[:-1], velocity_frame_ids[1:]):
+                    velocity = bbox.frame[next_frame][0] - bbox.frame[frame][0]
                     abs_velocities.append(torch.norm(velocity).item())
                 avg_velocity = torch.tensor(abs_velocities).mean().item()
 
@@ -180,7 +188,8 @@ class SceneLidar(Scene):
             all_points = []
             all_intensity = []
             all_normals = []
-            for frame in range(frame_range[0], frame_range[1] + 1):
+            init_frame_ids = available_frame_ids if available_frame_ids else list(range(frame_range[0], frame_range[1] + 1))
+            for frame in init_frame_ids:
                 lidar_pts, lidar_intensity = lidar.get_raw_points(frame, world=True)
                 raw_point_count = int(lidar_pts.shape[0])
                 lidar_pts, lidar_intensity, _ = _filter_points_by_min_distance(

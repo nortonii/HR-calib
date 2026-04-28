@@ -1,0 +1,7 @@
+parent_config: "configs/exp_kitti_10000_cam_single_opa_pose_higs_hybrid_3dgrut.yaml"
+
+exp_name: "kitti_center_10000_cam_single_opa_pose_higs_hybrid_3dgrut_rebase_anchor5"
+
+model:
+  pose_correction:
+    lambda_translation_anchor: 5.0

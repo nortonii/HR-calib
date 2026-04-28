@@ -1,9 +1,18 @@
 parent_config: "configs/exp_kitti_10000_cam_single_opa_pose_higs_default.yaml"
 
 exp_name: "kitti_center_10000_cam_single_opa_pose_higs_hybrid_3dgrut"
+seed: 42
+
+rebase_pose_after_initial_pure_pnp: true
 
 model:
   training_render_mode: hybrid_3dgrut
   camera_render_backend: 3dgut
   raytrace_backend: 3dgrt
   dc_only_sh: true
+  pose_correction:
+    translation_lr: 0.002
+    lambda_translation: 0.0
+    lambda_rotation: 0.0
+    lambda_translation_anchor: 10.0
+    lambda_rotation_anchor: 0.0

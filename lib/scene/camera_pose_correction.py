@@ -146,6 +146,7 @@ def _rotation_angle_deg(rotation: torch.Tensor) -> torch.Tensor:
 class CameraPoseCorrection(nn.Module):
     def __init__(self, cameras: dict, config=None, lidar_poses: dict = None):
         super().__init__()
+        self.config = config
         frame_ids = sorted(cameras.keys())
         if not frame_ids:
             raise ValueError("CameraPoseCorrection requires at least one camera frame.")
@@ -283,6 +284,9 @@ class CameraPoseCorrection(nn.Module):
                 "base_lidar_to_camera_quat",
                 _matrix_to_quaternion(base_extrinsic_rotation).unsqueeze(0).to(dtype=dtype),
             )
+            self.register_buffer("anchor_lidar_to_camera_rotation", base_extrinsic_rotation.unsqueeze(0).clone())
+            self.register_buffer("anchor_lidar_to_camera_translation", base_extrinsic_translation.unsqueeze(0).clone())
+            self.register_buffer("anchor_lidar_to_camera_valid", torch.zeros(1, dtype=torch.bool))
 
         # ── Learnable delta parameters (quaternion-delta paradigm) ──────────
         # delta_rotations_quat: [N, 4] quaternion [w,x,y,z], initialised to identity [1,0,0,0]
@@ -450,6 +454,26 @@ class CameraPoseCorrection(nn.Module):
         self.delta_rotations_quat.data[:, 0] = 1.0
 
     @torch.no_grad()
+    def rebase_shared_lidar_to_camera(self, frame_id: int):
+        if not self.use_shared_lidar_extrinsic:
+            raise RuntimeError("rebase_shared_lidar_to_camera is only available in shared-extrinsic mode.")
+        device = self.delta_translations.device
+        dtype = self.delta_translations.dtype
+        extrinsic_rotation, extrinsic_translation = self.corrected_lidar_to_camera(frame_id, device=device)
+        extrinsic_q = _matrix_to_quaternion(extrinsic_rotation).to(device=device, dtype=dtype)
+        if extrinsic_q[0] < 0:
+            extrinsic_q = -extrinsic_q
+        self.base_lidar_to_camera_quat[0].copy_(extrinsic_q)
+        self.base_lidar_to_camera_rotation[0].copy_(extrinsic_rotation.to(device=device, dtype=dtype))
+        self.base_lidar_to_camera_translation[0].copy_(extrinsic_translation.to(device=device, dtype=dtype))
+        self.anchor_lidar_to_camera_rotation[0].copy_(extrinsic_rotation.to(device=device, dtype=dtype))
+        self.anchor_lidar_to_camera_translation[0].copy_(extrinsic_translation.to(device=device, dtype=dtype))
+        self.anchor_lidar_to_camera_valid[0] = True
+        self.delta_translations.data.zero_()
+        self.delta_rotations_quat.data.fill_(0.0)
+        self.delta_rotations_quat.data[:, 0] = 1.0
+
+    @torch.no_grad()
     def apply_relative_camera_transform(
         self,
         frame_id: int,
@@ -503,8 +527,12 @@ class CameraPoseCorrection(nn.Module):
 
     def regularization_loss(self, frame_id: int, config=None):
         index = self._pose_index(frame_id)
+        if config is None:
+            config = self.config
         trans_weight = 0.0 if config is None else getattr(config, "lambda_translation", 0.0)
         rot_weight = 0.0 if config is None else getattr(config, "lambda_rotation", 0.0)
+        anchor_trans_weight = 0.0 if config is None else getattr(config, "lambda_translation_anchor", 0.0)
+        anchor_rot_weight = 0.0 if config is None else getattr(config, "lambda_rotation_anchor", 0.0)
         loss = torch.zeros((), device=self.delta_translations.device, dtype=self.delta_translations.dtype)
         if trans_weight > 0.0:
             loss = loss + float(trans_weight) * self.delta_translations[index].pow(2).sum()
@@ -513,6 +541,27 @@ class CameraPoseCorrection(nn.Module):
             identity_q = torch.zeros_like(self.delta_rotations_quat[index])
             identity_q[0] = 1.0
             loss = loss + float(rot_weight) * (self.delta_rotations_quat[index] - identity_q).pow(2).sum()
+        if (
+            self.use_shared_lidar_extrinsic
+            and bool(self.anchor_lidar_to_camera_valid[0])
+            and (anchor_trans_weight > 0.0 or anchor_rot_weight > 0.0)
+        ):
+            current_rotation, current_translation = self.corrected_lidar_to_camera(frame_id)
+            if anchor_trans_weight > 0.0:
+                anchor_translation = self.anchor_lidar_to_camera_translation[0].to(
+                    device=current_translation.device,
+                    dtype=current_translation.dtype,
+                )
+                loss = loss + float(anchor_trans_weight) * (current_translation - anchor_translation).pow(2).sum()
+            if anchor_rot_weight > 0.0:
+                anchor_rotation = self.anchor_lidar_to_camera_rotation[0].to(
+                    device=current_rotation.device,
+                    dtype=current_rotation.dtype,
+                )
+                relative_rotation = current_rotation @ anchor_rotation.transpose(0, 1)
+                cos_theta = torch.clamp((torch.trace(relative_rotation) - 1.0) * 0.5, min=-1.0, max=1.0)
+                theta = torch.acos(cos_theta)
+                loss = loss + float(anchor_rot_weight) * theta.pow(2)
         return loss
 
     def pose_magnitude(self, frame_id: int):

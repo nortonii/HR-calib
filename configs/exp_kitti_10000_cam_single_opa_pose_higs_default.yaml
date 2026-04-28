@@ -22,3 +22,5 @@ model:
     init_se3: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
     lambda_translation: 0.0
     lambda_rotation: 0.0
+    lambda_translation_anchor: 0.0
+    lambda_rotation_anchor: 0.0

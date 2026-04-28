@@ -1,0 +1,6 @@
+parent_config: "configs/exp_kitti_10000_cam_single_opa_pose_higs_hybrid_3dgrut_noanchor.yaml"
+
+exp_name: "kitti_center_10000_cam_single_opa_pose_higs_hybrid_3dgrut_noanchor_dssim09"
+
+opt:
+  lambda_dssim: 0.9
